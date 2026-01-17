@@ -1,3 +1,8 @@
+# 🔐 Токен берём ТОЛЬКО из переменной окружения
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+
 import requests
 import asyncio
 import html
@@ -7,12 +12,6 @@ from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CallbackQueryHandler
-
-
-import os
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
 
 BASE_IP = "83.69.139.205"
 URL = "https://strike.uz/"
