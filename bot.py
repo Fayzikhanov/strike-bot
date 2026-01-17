@@ -159,7 +159,7 @@ import a2s
 
 def get_server_info(port):
     try:
-        info = a2s.info((BASE_IP, port), timeout=1.5)
+        info = a2s.info((BASE_IP, port), timeout=3.5)
 
         return {
             "name": info.server_name,
@@ -170,7 +170,7 @@ def get_server_info(port):
 
     except Exception:
         return {
-            "name": f"Server {port}",
+            "name": f"Strike.Uz | {port}",
             "map": "unknown",
             "players": 0,
             "max": 0,
@@ -202,7 +202,7 @@ async def get_players_async(port):
         players = await asyncio.to_thread(
             a2s.players,
             (BASE_IP, port),
-            timeout=1.5
+            timeout=3.5
         )
 
         result = []
