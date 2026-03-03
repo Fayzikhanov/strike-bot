@@ -1,0 +1,188 @@
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --font-size: 16px;
+  --background: #121212;
+  --foreground: #FCFCFC;
+  --card: #1a1a1a;
+  --card-foreground: #FCFCFC;
+  --popover: #1a1a1a;
+  --popover-foreground: #FCFCFC;
+  --primary: #F08800;
+  --primary-foreground: #121212;
+  --secondary: #2a2a2a;
+  --secondary-foreground: #FCFCFC;
+  --muted: #2a2a2a;
+  --muted-foreground: #888888;
+  --accent: #F08800;
+  --accent-foreground: #121212;
+  --destructive: #ef4444;
+  --destructive-foreground: #FCFCFC;
+  --border: #2a2a2a;
+  --input: #1a1a1a;
+  --input-background: #1a1a1a;
+  --switch-background: #2a2a2a;
+  --font-weight-medium: 600;
+  --font-weight-normal: 400;
+  --ring: #F08800;
+  --radius: 0.5rem;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-input-background: var(--input-background);
+  --color-switch-background: var(--switch-background);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: 'Rajdhani', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    margin: 0;
+    overscroll-behavior-y: contain;
+    touch-action: manipulation;
+  }
+
+  html {
+    font-size: var(--font-size);
+    background: var(--background);
+    touch-action: manipulation;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: 'FURORE', 'Rajdhani', sans-serif;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  h1 {
+    font-size: 2rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.2;
+  }
+
+  h2 {
+    font-size: 1.5rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.3;
+  }
+
+  h3 {
+    font-size: 1.25rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.4;
+  }
+
+  h4 {
+    font-size: 1rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  label {
+    font-size: 0.875rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  button {
+    font-size: 1rem;
+    font-weight: var(--font-weight-medium);
+    line-height: 1.5;
+  }
+
+  input, textarea {
+    font-size: 1rem;
+    font-weight: var(--font-weight-normal);
+    line-height: 1.5;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: #1a1a1a;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: #2a2a2a;
+    border-radius: 4px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: #F08800;
+  }
+
+  /* Smooth transitions */
+  * {
+    transition-property: color, background-color, border-color;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 150ms;
+  }
+
+  /* Mobile tap highlight */
+  * {
+    -webkit-tap-highlight-color: rgba(240, 136, 0, 0.1);
+  }
+
+  /* Prevent text selection on buttons */
+  button {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Smooth scroll */
+  html {
+    scroll-behavior: smooth;
+  }
+
+  /* Mobile viewport fix */
+  body {
+    min-height: 100vh;
+    min-height: -webkit-fill-available;
+  }
+}
+
+@keyframes strikeWaitFloat {
+  0%, 100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+.strike-wait-float {
+  animation: strikeWaitFloat 1.55s ease-in-out infinite;
+}

@@ -1,0 +1,10 @@
+<svg width="500" height="100" viewBox="0 0 500 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Strike symbol (orange lightning bolts) -->
+  <path d="M10 5 L70 5 L50 50 L90 50 L20 95 L40 50 L10 50 Z" fill="#F08800"/>
+  <path d="M30 15 L80 15 L65 50 L95 50 L35 85 L50 50 L30 50 Z" fill="#F08800" opacity="0.6"/>
+  
+  <!-- STRIKE.UZ text in white -->
+  <text x="110" y="65" font-family="Arial, sans-serif" font-size="48" font-weight="900" fill="#FCFCFC" letter-spacing="2">STRIKE</text>
+  <circle cx="350" cy="55" r="4" fill="#F08800"/>
+  <text x="365" y="65" font-family="Arial, sans-serif" font-size="48" font-weight="900" fill="#FCFCFC" letter-spacing="2">UZ</text>
+</svg>

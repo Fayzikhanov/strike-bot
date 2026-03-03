@@ -1,0 +1,22 @@
+.env
+.venv/
+.venv313/
+__pycache__/
+*.pyc
+bot.log
+tunnel.log
+tunnel_debug.log
+miniapp.log
+watcher.log
+localtunnel.log
+.DS_Store
+.tmp_design2/
+.vercel
+
+# Runtime state
+data/
+
+# Miniapp build artifacts
+miniapp/node_modules/
+miniapp/dist/
+miniapp/.vercel/
