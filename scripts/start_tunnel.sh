@@ -3,18 +3,22 @@
 
 set -u
 
-REPO_DIR="/Users/fayzikhanov/strike_bot"
-LOG_FILE="$REPO_DIR/tunnel.log"
-URL_FILE="$REPO_DIR/data/web_app_url.txt"
-MINIAPP_BASE="https://miniapp-beta-two.vercel.app/"
-MINIAPP_VERSION="20260303190229"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+LOG_FILE="${TUNNEL_LOG_FILE:-$REPO_DIR/tunnel.log}"
+URL_FILE="${WEB_APP_URL_FILE:-$REPO_DIR/data/web_app_url.txt}"
+MINIAPP_BASE="${MINIAPP_BASE:-https://miniapp-beta-two.vercel.app/}"
+MINIAPP_VERSION="${MINIAPP_VERSION:-$(date '+%Y%m%d%H%M%S')}"
+API_PORT="${API_PORT:-8090}"
+CLOUDFLARED_BIN="${CLOUDFLARED_BIN:-cloudflared}"
 
 cd "$REPO_DIR" || exit 1
+mkdir -p "$(dirname "$URL_FILE")"
 
 while true; do
-  echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting cloudflared tunnel → localhost:8090" >> "$LOG_FILE"
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] starting cloudflared tunnel → localhost:${API_PORT}" >> "$LOG_FILE"
 
-  cloudflared tunnel --url http://localhost:8090 --no-autoupdate 2>&1 | tee -a "$LOG_FILE" | \
+  "$CLOUDFLARED_BIN" tunnel --url "http://127.0.0.1:${API_PORT}" --no-autoupdate 2>&1 | tee -a "$LOG_FILE" | \
   while IFS= read -r line; do
     if echo "$line" | grep -qE 'trycloudflare\.com'; then
       tunnel_url=$(echo "$line" | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com')
