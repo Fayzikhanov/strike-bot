@@ -1,7 +1,11 @@
 import { FormEvent, useEffect, useState } from "react";
 import { Eye, EyeOff, Lock, ShieldCheck } from "lucide-react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { fetchAdminSummary, getResolvedApiBaseUrl } from "../api/strikeApi";
+import {
+  fetchAdminSummary,
+  getResolvedApiBaseUrl,
+  setPreferredApiBaseUrl,
+} from "../api/strikeApi";
 import { readSavedAdminKey, saveAdminKey } from "../lib/adminAuth";
 
 type LocationState = {
@@ -15,6 +19,8 @@ export function AdminLogin() {
   const [showKey, setShowKey] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [apiBaseInput, setApiBaseInput] = useState(() => getResolvedApiBaseUrl());
+  const [apiBaseNotice, setApiBaseNotice] = useState("");
 
   useEffect(() => {
     const saved = readSavedAdminKey().trim();
@@ -38,6 +44,15 @@ export function AdminLogin() {
 
     setSubmitting(true);
     setErrorMessage("");
+    setApiBaseNotice("");
+
+    const safeApiBase = apiBaseInput.trim();
+    if (safeApiBase) {
+      const resolvedApiBase = setPreferredApiBaseUrl(safeApiBase);
+      if (resolvedApiBase) {
+        setApiBaseInput(resolvedApiBase);
+      }
+    }
 
     try {
       await fetchAdminSummary(safeKey);
@@ -91,6 +106,35 @@ export function AdminLogin() {
                   {showKey ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                 </button>
               </div>
+
+              <label className="block text-xs uppercase tracking-[0.14em] text-[#7d7d85]">API URL</label>
+              <input
+                type="text"
+                value={apiBaseInput}
+                onChange={(event) => {
+                  setApiBaseInput(event.target.value);
+                  setApiBaseNotice("");
+                }}
+                placeholder="https://...trycloudflare.com"
+                className="w-full rounded-xl border border-[#2f2f35] bg-[#0f0f10] px-3 py-3 text-sm text-white outline-none ring-0 focus:border-[#f08800]"
+              />
+              <button
+                type="button"
+                onClick={() => {
+                  const resolved = setPreferredApiBaseUrl(apiBaseInput.trim());
+                  setApiBaseInput(resolved);
+                  setApiBaseNotice(resolved ? "API URL применён." : "API URL сброшен.");
+                }}
+                className="w-full rounded-xl border border-[#3a3a45] bg-[#1a1a1f] px-4 py-2.5 text-xs font-bold uppercase tracking-[0.08em] text-[#d4d4dc]"
+              >
+                Применить API URL
+              </button>
+
+              {apiBaseNotice && (
+                <div className="rounded-xl border border-[#2f5f2f] bg-[#0f2710] px-3 py-2 text-sm text-[#9ae6a0]">
+                  {apiBaseNotice}
+                </div>
+              )}
 
               {errorMessage && (
                 <div className="rounded-xl border border-[#7f1d1d] bg-[#3b1212] px-3 py-2 text-sm text-[#fca5a5]">

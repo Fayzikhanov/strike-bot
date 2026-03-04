@@ -657,7 +657,11 @@ interface FetchPrivilegeAccountParams {
   serverName?: string;
 }
 
-const DEFAULT_PRODUCTION_API_BASE_URL = "https://sequence-mitsubishi-trek-engaged.trycloudflare.com";
+const DEFAULT_PRODUCTION_API_BASE_URLS = [
+  "https://promising-inclusion-dollar-cancel.trycloudflare.com",
+  "https://converted-die-celebs-amended.trycloudflare.com",
+  "https://sequence-mitsubishi-trek-engaged.trycloudflare.com",
+] as const;
 const API_BASE_STORAGE_KEY = "strike_api_base_url_v1";
 
 function normalizeApiBaseUrl(rawValue: string): string {
@@ -736,16 +740,16 @@ if (RUNTIME_API_BASE_URL) {
 }
 const RAW_API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL ?? "");
 const SAVED_API_BASE_URL = readSavedApiBaseUrl();
-const DEFAULT_API_BASE_URL = normalizeApiBaseUrl(
-  import.meta.env.PROD ? DEFAULT_PRODUCTION_API_BASE_URL : "",
-);
+const DEFAULT_API_BASE_URLS = import.meta.env.PROD
+  ? DEFAULT_PRODUCTION_API_BASE_URLS.map((item) => normalizeApiBaseUrl(item))
+  : [];
 const API_BASE_CANDIDATES = Array.from(
   new Set(
     [
       RUNTIME_API_BASE_URL,
       SAVED_API_BASE_URL,
       RAW_API_BASE_URL,
-      DEFAULT_API_BASE_URL,
+      ...DEFAULT_API_BASE_URLS,
       ...(import.meta.env.PROD ? [] : [""]),
     ]
       .map((item) => normalizeApiBaseUrl(item))
