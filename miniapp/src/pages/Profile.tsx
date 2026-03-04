@@ -425,7 +425,15 @@ export function Profile() {
   }, [isUz, telegramUserId]);
 
   const handleClaimWelcomeBonus = useCallback(async () => {
-    if (telegramUserId <= 0 || isClaimingWelcomeBonus) {
+    if (telegramUserId <= 0) {
+      setWelcomeBonusError(
+        isUz
+          ? "Telegram foydalanuvchisini aniqlab bo'lmadi. Miniappni Telegram ichida oching."
+          : "Не удалось определить Telegram пользователя. Откройте мини-приложение внутри Telegram.",
+      );
+      return;
+    }
+    if (isClaimingWelcomeBonus) {
       return;
     }
     setIsClaimingWelcomeBonus(true);
@@ -461,6 +469,40 @@ export function Profile() {
       }
       void loadHistory(false);
     } catch {
+      try {
+        const fallback = await fetchWelcomeBonusStatus(telegramUserId);
+        const fallbackClaimed = Boolean(fallback.status?.claimed);
+        const fallbackClaimedAt = Math.max(0, Number(fallback.status?.claimedAt || 0));
+        const fallbackAmount = Math.max(
+          0,
+          Number(fallback.status?.amount ?? fallback.bonusAmount ?? 0),
+        );
+        const fallbackBalance = Math.max(0, Number(fallback.balance?.balance || 0));
+
+        setWelcomeBonusStatus({
+          eligible: Boolean(fallback.status?.eligible),
+          claimed: fallbackClaimed,
+          claimedAt: fallbackClaimedAt,
+          amount: fallbackAmount,
+        });
+        setBalance(fallbackBalance);
+
+        if (fallbackClaimed) {
+          setWelcomeBonusError(null);
+          const nowSeconds = Math.floor(Date.now() / 1000);
+          const claimedRecently = fallbackClaimedAt > 0 && Math.abs(nowSeconds - fallbackClaimedAt) <= 180;
+          if (claimedRecently) {
+            setWelcomeBonusToast({
+              amount: fallbackAmount,
+              balanceAfter: fallbackBalance,
+            });
+          }
+          void loadHistory(false);
+          return;
+        }
+      } catch {
+        // Keep original fallback error below.
+      }
       setWelcomeBonusError(
         isUz
           ? "Start bonusini olishda xatolik yuz berdi. Qayta urinib ko'ring."
@@ -1083,7 +1125,12 @@ export function Profile() {
               <button
                 type="button"
                 onClick={handleClaimWelcomeBonus}
-                disabled={isLoadingWelcomeBonus || isClaimingWelcomeBonus || Boolean(welcomeBonusStatus?.claimed)}
+                disabled={
+                  telegramUserId <= 0
+                  || isLoadingWelcomeBonus
+                  || isClaimingWelcomeBonus
+                  || Boolean(welcomeBonusStatus?.claimed)
+                }
                 className={`mt-3 w-full rounded-lg border px-3 py-2.5 text-sm font-black uppercase tracking-wide transition-colors ${
                   welcomeBonusStatus?.claimed
                     ? "bg-[#113322] border-[#1d7f4b] text-[#86efac] cursor-default"

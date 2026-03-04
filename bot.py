@@ -6743,6 +6743,62 @@ def send_welcome_bonus_report_to_group(
         return False
 
 
+def dispatch_welcome_bonus_notifications_async(
+    *,
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+    amount_added: int,
+    balance_before: int,
+    balance_after: int,
+    language: str = "ru",
+) -> bool:
+    safe_user_id = int(_safe_int(user_id, 0))
+    if safe_user_id <= 0:
+        return False
+
+    def _worker():
+        notification_sent = send_welcome_bonus_confirmation_message(
+            user_id=safe_user_id,
+            amount_added=amount_added,
+            balance_before=balance_before,
+            balance_after=balance_after,
+            language=language,
+        )
+        report_sent = send_welcome_bonus_report_to_group(
+            user_id=safe_user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            amount_added=amount_added,
+            balance_before=balance_before,
+            balance_after=balance_after,
+        )
+        print(
+            (
+                f"[WELCOME BONUS NOTIFY] user_id={safe_user_id} "
+                f"notification_sent={int(bool(notification_sent))} "
+                f"report_sent={int(bool(report_sent))}"
+            ),
+            file=sys.stderr,
+        )
+
+    try:
+        threading.Thread(
+            target=_worker,
+            daemon=True,
+            name=f"welcome-bonus-notify-{safe_user_id}",
+        ).start()
+        return True
+    except Exception as error:
+        print(
+            f"[WELCOME BONUS NOTIFY ERROR] Failed to start async worker: {_redact_sensitive_text(error)}",
+            file=sys.stderr,
+        )
+        return False
+
+
 def send_legacy_import_confirmation_message(
     *,
     user_id: int,
@@ -7937,16 +7993,11 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             balance_after = _safe_int(claim_result.get("balance_after", 0), 0)
             notification_sent = False
             report_sent = False
+            notification_queued = False
+            report_queued = False
 
             if claimed_now:
-                notification_sent = send_welcome_bonus_confirmation_message(
-                    user_id=int(user_id),
-                    amount_added=WELCOME_BONUS_AMOUNT,
-                    balance_before=balance_before,
-                    balance_after=balance_after,
-                    language=language,
-                )
-                report_sent = send_welcome_bonus_report_to_group(
+                notification_queued = dispatch_welcome_bonus_notifications_async(
                     user_id=int(user_id),
                     username=username,
                     first_name=first_name,
@@ -7954,7 +8005,11 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     amount_added=WELCOME_BONUS_AMOUNT,
                     balance_before=balance_before,
                     balance_after=balance_after,
+                    language=language,
                 )
+                report_queued = bool(notification_queued and get_reports_chat_id() is not None)
+                notification_sent = bool(notification_queued)
+                report_sent = bool(report_queued)
 
             self._send_json(
                 200,
@@ -7971,6 +8026,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     "balanceAfter": int(balance_after),
                     "notificationSent": bool(notification_sent),
                     "reportSent": bool(report_sent),
+                    "notificationQueued": bool(notification_queued),
+                    "reportQueued": bool(report_queued),
                     "timestamp": int(time.time()),
                 },
             )
