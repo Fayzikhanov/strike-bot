@@ -100,6 +100,8 @@ A2S_COOLDOWN_SECONDS = float(os.getenv("A2S_COOLDOWN_SECONDS", "60").strip() or 
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8090"))
 ADMIN_DASHBOARD_KEY = os.getenv("ADMIN_DASHBOARD_KEY", "").strip()
+OWNER_BROADCAST_USER_ID = max(_env_int("OWNER_BROADCAST_USER_ID", 829988791), 0)
+RELEASE_NEWS_VIDEO_URL = os.getenv("RELEASE_NEWS_VIDEO_URL", "").strip()
 WELCOME_BONUS_AMOUNT = max(_env_int("WELCOME_BONUS_AMOUNT", 10000), 0)
 ADMIN_DEFAULT_PAGE_SIZE = max(_env_int("ADMIN_DEFAULT_PAGE_SIZE", 30), 1)
 ADMIN_MAX_PAGE_SIZE = max(_env_int("ADMIN_MAX_PAGE_SIZE", 100), ADMIN_DEFAULT_PAGE_SIZE)
@@ -153,6 +155,10 @@ PAYMENT_UPLOAD_SESSION_SECONDS = max(
     60,
 )
 PAYMENT_SUPPORT_CONTACT = os.getenv("PAYMENT_SUPPORT_CONTACT", "@MCCALLSTRIKE").strip() or "@MCCALLSTRIKE"
+PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS = max(
+    _env_int("PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS", 14 * 24 * 60 * 60),
+    0,
+)
 
 SERVERS = {
     "public": {
@@ -201,6 +207,11 @@ TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
 
 BONUS_DB_PUBLIC = os.getenv("BONUS_DB_PUBLIC", "c_2strike").strip() or "c_2strike"
 BONUS_TABLE_NAME = os.getenv("BONUS_TABLE_NAME", "AesStatsPublic").strip() or "AesStatsPublic"
+BONUS_TABLE_PUBLIC = os.getenv("BONUS_TABLE_PUBLIC", BONUS_TABLE_NAME).strip() or BONUS_TABLE_NAME
+BONUS_DB_ONLY_DUST = os.getenv("BONUS_DB_ONLY_DUST", BONUS_DB_PUBLIC).strip() or BONUS_DB_PUBLIC
+BONUS_TABLE_ONLY_DUST = (
+    os.getenv("BONUS_TABLE_ONLY_DUST", "AesStatsOnlyDust").strip() or "AesStatsOnlyDust"
+)
 BONUS_ROW_ID_COLUMN = os.getenv("BONUS_ROW_ID_COLUMN", "id").strip() or "id"
 BONUS_STEAM_ID_COLUMN = os.getenv("BONUS_STEAM_ID_COLUMN", "steamid").strip() or "steamid"
 BONUS_NAME_COLUMN = os.getenv("BONUS_NAME_COLUMN", "name").strip() or "name"
@@ -2699,6 +2710,7 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
         reverse=True,
     )
     now_local = datetime.datetime.now(REPORTS_TIMEZONE)
+    now_ts = int(time.time())
     snapshots = []
     seen_account_keys = set()
 
@@ -2735,6 +2747,20 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
         if not privilege_key:
             continue
 
+        password_change_meta = _extract_password_change_meta_from_purchase_record(record)
+        last_password_change_at = int(password_change_meta.get("last_password_change_at", 0) or 0)
+        next_password_change_at = int(password_change_meta.get("next_password_change_at", 0) or 0)
+        can_change_password = bool(
+            server_id
+            and identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME
+            and nickname
+        )
+        password_change_seconds_remaining = (
+            max(next_password_change_at - now_ts, 0)
+            if next_password_change_at > 0
+            else 0
+        )
+
         seen_account_keys.add(account_key)
         snapshots.append(
             {
@@ -2751,9 +2777,14 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
                 "total_days": int(total_days),
                 "days_passed": int(days_passed),
                 "can_renew": bool(server_id and privilege_key),
+                "can_change_password": bool(can_change_password),
                 "source": str(record.get("source", "")).strip().lower(),
                 "password": str(record.get("renew_password", "")).strip(),
                 "is_permanent": bool(is_permanent),
+                "last_password_change_at": int(last_password_change_at),
+                "next_password_change_at": int(next_password_change_at),
+                "password_change_seconds_remaining": int(password_change_seconds_remaining),
+                "password_change_cooldown_seconds": int(PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS),
             }
         )
         if len(snapshots) >= max_items:
@@ -2895,6 +2926,16 @@ PUBLIC_STYLE_1_KEYS = {"vip", "prime", "legend"}
 PUBLIC_STYLE_1_PORT = 27015
 PUBLIC_SERVER_PORTS = set(SERVERS.get("public", {}).get("servers", []))
 BONUS_ENABLED_SERVER_PORTS = {27015, 27016}
+BONUS_STORAGE_BY_PORT = {
+    27015: {
+        "db": BONUS_DB_PUBLIC,
+        "table": BONUS_TABLE_PUBLIC,
+    },
+    27016: {
+        "db": BONUS_DB_ONLY_DUST,
+        "table": BONUS_TABLE_ONLY_DUST,
+    },
+}
 BONUS_TARIFF_PRICE_BY_BONUS_AMOUNT = {
     2250: 10000,
     7500: 30000,
@@ -3230,6 +3271,88 @@ def _is_active_privilege_product_type(product_type):
     return normalized in ACTIVE_PRIVILEGE_PRODUCT_TYPES
 
 
+def _calculate_privilege_password_change_next_allowed_at(last_password_change_at):
+    safe_last_changed_at = max(_safe_int(last_password_change_at, 0), 0)
+    if safe_last_changed_at <= 0 or PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS <= 0:
+        return 0
+    return int(safe_last_changed_at + PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS)
+
+
+def _extract_password_change_meta_from_purchase_record(record):
+    safe_record = record if isinstance(record, dict) else {}
+    last_changed_at = max(_safe_int(safe_record.get("last_password_change_at", 0), 0), 0)
+    computed_next_allowed_at = _calculate_privilege_password_change_next_allowed_at(last_changed_at)
+    stored_next_allowed_at = max(_safe_int(safe_record.get("next_password_change_at", 0), 0), 0)
+    next_allowed_at = max(computed_next_allowed_at, stored_next_allowed_at)
+    if last_changed_at <= 0:
+        next_allowed_at = 0
+    return {
+        "last_password_change_at": int(last_changed_at),
+        "next_password_change_at": int(next_allowed_at),
+    }
+
+
+def _format_privilege_password_change_datetime(timestamp, language="ru"):
+    safe_timestamp = max(_safe_int(timestamp, 0), 0)
+    if safe_timestamp <= 0:
+        return ""
+    try:
+        dt_value = datetime.datetime.fromtimestamp(safe_timestamp, tz=REPORTS_TIMEZONE)
+    except Exception:
+        dt_value = datetime.datetime.fromtimestamp(safe_timestamp)
+    return dt_value.strftime("%d.%m.%Y %H:%M")
+
+
+def _localize_privilege_password_change_message(message_key, language="ru", *, next_allowed_at=0):
+    normalized_language = str(language or "ru").strip().lower()
+    use_uz = normalized_language == "uz"
+    cooldown_dt = _format_privilege_password_change_datetime(next_allowed_at, language=normalized_language)
+    ru_messages = {
+        "invalid_user": "Не удалось определить Telegram-пользователя. Откройте миниапп снова.",
+        "unknown_server": "Сервер не найден.",
+        "identifier_required": "Укажите Nick.",
+        "steam_not_supported": "Смена пароля доступна только для режима NickName.",
+        "current_password_required": "Введите текущий пароль.",
+        "current_password_invalid": "Текущий пароль неверный.",
+        "new_password_required": "Введите новый пароль.",
+        "new_password_invalid": "Новый пароль должен быть 1-20 символов (A-Z, a-z, 0-9).",
+        "new_password_same": "Новый пароль должен отличаться от текущего.",
+        "account_not_found": "Активная привилегия не найдена для указанных данных.",
+        "account_not_owned": "Эта привилегия привязана к другому Telegram аккаунту.",
+        "account_disabled": "Привилегия отключена в users.ini.",
+        "account_expired": "Привилегия найдена, но уже истекла.",
+        "cooldown": (
+            f"Пароль можно менять раз в 2 недели. Следующая смена доступна с {cooldown_dt}."
+            if cooldown_dt
+            else "Пароль можно менять раз в 2 недели."
+        ),
+        "ftp_failed": "Не удалось изменить пароль в users.ini. Попробуйте позже.",
+    }
+    uz_messages = {
+        "invalid_user": "Telegram foydalanuvchisini aniqlab bo'lmadi. Miniappni qayta oching.",
+        "unknown_server": "Server topilmadi.",
+        "identifier_required": "Nick kiriting.",
+        "steam_not_supported": "Parolni almashtirish faqat NickName rejimida mavjud.",
+        "current_password_required": "Joriy parolni kiriting.",
+        "current_password_invalid": "Joriy parol noto'g'ri.",
+        "new_password_required": "Yangi parolni kiriting.",
+        "new_password_invalid": "Yangi parol 1-20 belgidan iborat bo'lishi kerak (A-Z, a-z, 0-9).",
+        "new_password_same": "Yangi parol joriy paroldan farq qilishi kerak.",
+        "account_not_found": "Ko'rsatilgan ma'lumotlar bo'yicha faol imtiyoz topilmadi.",
+        "account_not_owned": "Bu imtiyoz boshqa Telegram akkauntga biriktirilgan.",
+        "account_disabled": "Imtiyoz users.ini ichida o'chirilgan.",
+        "account_expired": "Imtiyoz topildi, lekin muddati tugagan.",
+        "cooldown": (
+            f"Parolni faqat har 2 haftada bir marta almashtirish mumkin. Keyingi almashtirish {cooldown_dt} dan keyin."
+            if cooldown_dt
+            else "Parolni faqat har 2 haftada bir marta almashtirish mumkin."
+        ),
+        "ftp_failed": "users.ini ichida parolni almashtirib bo'lmadi. Keyinroq qayta urinib ko'ring.",
+    }
+    catalog = uz_messages if use_uz else ru_messages
+    return catalog.get(str(message_key or "").strip(), catalog["ftp_failed"])
+
+
 def _build_duration_label(months, language="ru"):
     try:
         safe_months = max(int(months), 1)
@@ -3368,6 +3491,11 @@ def _find_active_privilege_owner(*, server_id="", server_name="", identifier_typ
             return None
         candidate_records = [dict(item) for item in purchases if isinstance(item, dict)]
 
+    candidate_records.sort(
+        key=lambda item: int(item.get("created_at", 0) or 0),
+        reverse=True,
+    )
+
     for record in candidate_records:
         if str(record.get("status", "")).strip().lower() != "active":
             continue
@@ -3396,6 +3524,7 @@ def _find_active_privilege_owner(*, server_id="", server_name="", identifier_typ
         if record_key != binding_key:
             continue
 
+        password_change_meta = _extract_password_change_meta_from_purchase_record(record)
         return {
             "user_id": _safe_int(record.get("user_id", 0), 0),
             "username": str(record.get("username", "")).strip().lstrip("@"),
@@ -3410,7 +3539,67 @@ def _find_active_privilege_owner(*, server_id="", server_name="", identifier_typ
             "remaining_days": int(lifecycle.get("remaining_days", 0)),
             "total_days": int(lifecycle.get("total_days", 0)),
             "is_permanent": bool(lifecycle.get("is_permanent")),
+            "last_password_change_at": int(password_change_meta.get("last_password_change_at", 0) or 0),
+            "next_password_change_at": int(password_change_meta.get("next_password_change_at", 0) or 0),
+            "password": str(record.get("renew_password", "")).strip(),
         }
+
+    return None
+
+
+def _update_active_privilege_password_metadata(
+    *,
+    server_id="",
+    server_name="",
+    identifier_type=PRIVILEGE_IDENTIFIER_NICKNAME,
+    nickname="",
+    steam_id="",
+    password="",
+    changed_at=0,
+    user_id=0,
+):
+    owner = _find_active_privilege_owner(
+        server_id=server_id,
+        server_name=server_name,
+        identifier_type=identifier_type,
+        nickname=nickname,
+        steam_id=steam_id,
+    )
+    if not owner:
+        return None
+
+    safe_user_id = _safe_int(user_id, 0)
+    owner_user_id = _safe_int(owner.get("user_id", 0), 0)
+    if safe_user_id > 0 and owner_user_id > 0 and owner_user_id != safe_user_id:
+        return None
+
+    purchase_id = str(owner.get("purchase_id", "")).strip()
+    if not purchase_id:
+        return None
+
+    safe_password = str(password or "").strip()
+    safe_changed_at = max(_safe_int(changed_at, 0), 0)
+    next_allowed_at = _calculate_privilege_password_change_next_allowed_at(safe_changed_at)
+
+    with REPORTS_LOCK:
+        purchases = REPORTS_STORE.setdefault("purchases", [])
+        if not isinstance(purchases, list):
+            return None
+        for record in purchases:
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("id", "")).strip() != purchase_id:
+                continue
+            record["renew_password"] = safe_password
+            record["renew_password_set"] = bool(safe_password)
+            record["last_password_change_at"] = int(safe_changed_at)
+            record["next_password_change_at"] = int(next_allowed_at)
+            _save_reports_store_locked()
+            return {
+                "purchase_id": purchase_id,
+                "last_password_change_at": int(safe_changed_at),
+                "next_password_change_at": int(next_allowed_at),
+            }
 
     return None
 
@@ -3729,6 +3918,132 @@ def _verify_privilege_password_from_users_ini(
         "is_permanent": bool(found.get("is_permanent")),
         "is_disabled": bool(found["is_disabled"]),
         "is_expired": _users_ini_entry_is_expired(found),
+    }
+
+
+def _change_privilege_password_in_users_ini(
+    *,
+    server_id,
+    server_name,
+    identifier_type=PRIVILEGE_IDENTIFIER_NICKNAME,
+    nickname="",
+    steam_id="",
+    current_password="",
+    new_password="",
+):
+    users_ini_path = _resolve_ftp_users_ini_path(server_id, server_name, raise_if_missing=False)
+    if not users_ini_path:
+        return {
+            "supported": False,
+            "exists": False,
+            "changed": False,
+            "valid_current_password": False,
+        }
+
+    resolved_identifier_type, resolved_identifier_value = _sanitize_privilege_identifier(
+        identifier_type=identifier_type,
+        nickname=nickname,
+        steam_id=steam_id,
+    )
+    if resolved_identifier_type == PRIVILEGE_IDENTIFIER_STEAM:
+        raise ValueError("Password change is not supported for STEAM_ID mode")
+
+    current_password_safe = _sanitize_password(current_password, field_name="Current password")
+    new_password_safe = _sanitize_password(new_password, field_name="New password")
+    users_ini_bytes = _download_users_ini_bytes(users_ini_path)
+    users_ini_text = users_ini_bytes.decode("latin-1")
+    lines = users_ini_text.splitlines(keepends=True)
+    found = _find_users_ini_entry(lines, resolved_identifier_type, resolved_identifier_value)
+    if not found:
+        return {
+            "supported": True,
+            "exists": False,
+            "changed": False,
+            "valid_current_password": False,
+            "identifier_type": resolved_identifier_type,
+        }
+
+    is_expired = _users_ini_entry_is_expired(found)
+    is_disabled = bool(found.get("is_disabled"))
+    days_value = _users_ini_entry_days_value(found)
+    if is_disabled or is_expired:
+        return {
+            "supported": True,
+            "exists": True,
+            "changed": False,
+            "valid_current_password": False,
+            "identifier_type": resolved_identifier_type,
+            "nickname": found["nickname"],
+            "steam_id": "",
+            "flags": found["flags"],
+            "privilege": _label_for_privilege_flags(found["flags"]),
+            "days": days_value,
+            "is_permanent": bool(found.get("is_permanent")),
+            "is_disabled": is_disabled,
+            "is_expired": is_expired,
+        }
+
+    if current_password_safe != found["password"]:
+        return {
+            "supported": True,
+            "exists": True,
+            "changed": False,
+            "valid_current_password": False,
+            "identifier_type": resolved_identifier_type,
+            "nickname": found["nickname"],
+            "steam_id": "",
+            "flags": found["flags"],
+            "privilege": _label_for_privilege_flags(found["flags"]),
+            "days": days_value,
+            "is_permanent": bool(found.get("is_permanent")),
+            "is_disabled": is_disabled,
+            "is_expired": is_expired,
+        }
+
+    if new_password_safe == found["password"]:
+        return {
+            "supported": True,
+            "exists": True,
+            "changed": False,
+            "valid_current_password": True,
+            "same_password": True,
+            "identifier_type": resolved_identifier_type,
+            "nickname": found["nickname"],
+            "steam_id": "",
+            "flags": found["flags"],
+            "privilege": _label_for_privilege_flags(found["flags"]),
+            "days": days_value,
+            "is_permanent": bool(found.get("is_permanent")),
+            "is_disabled": is_disabled,
+            "is_expired": is_expired,
+        }
+
+    duration_value = "" if bool(found.get("is_permanent")) else str(max(_safe_int(found.get("days", 0), 0), 0))
+    updated_line = (
+        f"\"{found['nickname']}\" \"{new_password_safe}\" "
+        f"\"{found['flags']}\" \"{found['access']}\" \"{duration_value}\""
+    )
+    line_newline = found["newline"] or _choose_users_ini_newline(users_ini_bytes)
+    lines[int(found["index"])] = f"{updated_line}{line_newline}"
+
+    updated_text = "".join(lines)
+    updated_bytes = updated_text.encode("latin-1")
+    _upload_users_ini_bytes(updated_bytes, users_ini_bytes, users_ini_path)
+    return {
+        "supported": True,
+        "exists": True,
+        "changed": True,
+        "valid_current_password": True,
+        "identifier_type": resolved_identifier_type,
+        "nickname": found["nickname"],
+        "steam_id": "",
+        "flags": found["flags"],
+        "privilege": _label_for_privilege_flags(found["flags"]),
+        "days": days_value,
+        "is_permanent": bool(found.get("is_permanent")),
+        "is_disabled": is_disabled,
+        "is_expired": is_expired,
+        "users_ini_path": users_ini_path,
     }
 
 
@@ -4410,16 +4725,25 @@ def _extract_first_table_row_cells(query_page_html):
     return cleaned_cells
 
 
-def _bonus_database_by_server_id(server_id):
-    try:
-        server_port = int(server_id)
-    except (TypeError, ValueError):
+def _bonus_storage_by_server_id(server_id):
+    port = _normalize_server_port(server_id)
+    if port is None:
         return None
 
-    if server_port in SERVERS.get("public", {}).get("servers", []):
-        return BONUS_DB_PUBLIC
+    config = BONUS_STORAGE_BY_PORT.get(port)
+    if not isinstance(config, dict):
+        return None
 
-    return None
+    db_name = str(config.get("db", "")).strip()
+    table_name = str(config.get("table", "")).strip()
+    if not db_name or not table_name:
+        return None
+
+    return {
+        "db": db_name,
+        "table": table_name,
+        "port": int(port),
+    }
 
 
 def fetch_bonus_account(server_id, steam_id):
@@ -4427,11 +4751,12 @@ def fetch_bonus_account(server_id, steam_id):
     if not is_valid_steam_id(normalized_steam_id):
         raise ValueError("Invalid STEAM_ID format")
 
-    db_name = _bonus_database_by_server_id(server_id)
-    if not db_name:
-        raise ValueError("Bonus purchase is available only for Public servers")
+    storage = _bonus_storage_by_server_id(server_id)
+    if not storage:
+        raise ValueError("Bonus purchase is available only for Public and Only Dust servers")
 
-    table_name = _sanitize_sql_identifier(BONUS_TABLE_NAME)
+    db_name = str(storage["db"]).strip()
+    table_name = _sanitize_sql_identifier(storage["table"])
     row_id_column = _sanitize_sql_identifier(BONUS_ROW_ID_COLUMN)
     steam_column = _sanitize_sql_identifier(BONUS_STEAM_ID_COLUMN)
     name_column = _sanitize_sql_identifier(BONUS_NAME_COLUMN)
@@ -4470,6 +4795,7 @@ def fetch_bonus_account(server_id, steam_id):
         "nickname": nickname or "-",
         "bonus_count": bonus_count,
         "database": db_name,
+        "table": str(storage["table"]).strip(),
     }
 
 
@@ -4486,8 +4812,12 @@ def apply_bonus_purchase(server_id, steam_id, bonus_amount):
     if not account_before:
         return None
 
-    db_name = account_before["database"]
-    table_name = _sanitize_sql_identifier(BONUS_TABLE_NAME)
+    db_name = str(account_before.get("database", "")).strip()
+    table_name_raw = str(account_before.get("table", "")).strip()
+    if not db_name or not table_name_raw:
+        raise RuntimeError("Bonus storage is not resolved for this server")
+
+    table_name = _sanitize_sql_identifier(table_name_raw)
     row_id_column = _sanitize_sql_identifier(BONUS_ROW_ID_COLUMN)
     bonus_column = _sanitize_sql_identifier(BONUS_VALUE_COLUMN)
     try:
@@ -4614,6 +4944,61 @@ def build_user_mention(user_id, username="", first_name="", last_name=""):
     return f'<a href="tg://user?id={int(user_id)}">{html.escape(display_name)}</a>'
 
 
+def _get_release_news_recipients():
+    with REPORTS_LOCK:
+        user_activity = REPORTS_STORE.get("user_activity")
+        if not isinstance(user_activity, dict):
+            return []
+        raw_user_ids = list(user_activity.keys())
+
+    recipients = []
+    seen = set()
+    for raw_user_id in raw_user_ids:
+        safe_user_id = _safe_int(raw_user_id, 0)
+        if safe_user_id <= 0 or safe_user_id in seen:
+            continue
+        seen.add(safe_user_id)
+        recipients.append(int(safe_user_id))
+
+    recipients.sort()
+    return recipients
+
+
+def _build_release_news_message(video_url):
+    safe_video_url = str(video_url or "").strip()
+    escaped_video_url = html.escape(safe_video_url, quote=True)
+
+    uz_lines = [
+        "🔥 <b>STRIKE UZ BOT YANGILANDI</b>",
+        "",
+        "Assalomu alaykum! Botda quyidagi yangi bo'limlar ishga tushdi:",
+        "• 📱 Mini App",
+        "• 📊 Serverlar va o'yinchilar monitoringi",
+        "• 💳 To'lov va balansni to'ldirish",
+        "• 🎁 Cashback tizimi",
+        "• 🛒 Onlayn xaridlar",
+    ]
+
+    ru_lines = [
+        "🔥 <b>БОТ STRIKE UZ ОБНОВЛЁН</b>",
+        "",
+        "Всем привет! В боте появились новые возможности:",
+        "• 📱 Mini App",
+        "• 📊 Мониторинг серверов и игроков",
+        "• 💳 Оплата и пополнение баланса",
+        "• 🎁 Кэшбеки",
+        "• 🛒 Онлайн-покупки",
+    ]
+
+    if safe_video_url:
+        uz_lines.append(f'🎬 Video qo\'llanma: <a href="{escaped_video_url}">Ko\'rish</a>')
+        uz_lines.append(f"🔗 {escaped_video_url}")
+        ru_lines.append(f'🎬 Видео-обзор: <a href="{escaped_video_url}">Открыть</a>')
+        ru_lines.append(f"🔗 {escaped_video_url}")
+
+    return "\n".join(uz_lines + ["", "━━━━━━━━━━━━", ""] + ru_lines)
+
+
 def create_purchase_record(
     *,
     user_id,
@@ -4637,9 +5022,19 @@ def create_purchase_record(
     bonus_after=0,
     source="purchase",
     renew_password="",
+    last_password_change_at=0,
+    next_password_change_at=0,
 ):
     safe_password = str(password or "").strip()
     safe_renew_password = str(renew_password or "").strip()
+    safe_last_password_change_at = max(_safe_int(last_password_change_at, 0), 0)
+    computed_next_password_change_at = _calculate_privilege_password_change_next_allowed_at(
+        safe_last_password_change_at
+    )
+    safe_next_password_change_at = max(_safe_int(next_password_change_at, 0), 0)
+    safe_next_password_change_at = max(safe_next_password_change_at, computed_next_password_change_at)
+    if safe_last_password_change_at <= 0:
+        safe_next_password_change_at = 0
     return {
         "id": uuid.uuid4().hex[:14],
         "created_at": int(time.time()),
@@ -4667,6 +5062,8 @@ def create_purchase_record(
         "source": str(source or "purchase").strip().lower() or "purchase",
         "renew_password_set": bool(safe_renew_password),
         "renew_password": safe_renew_password if safe_renew_password else "",
+        "last_password_change_at": int(safe_last_password_change_at),
+        "next_password_change_at": int(safe_next_password_change_at),
         "report_message_id": None,
     }
 
@@ -5747,6 +6144,93 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=main_inline_keyboard() 
         )
+
+
+async def release_news_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not message or not user:
+        return
+
+    requester_id = int(_safe_int(getattr(user, "id", 0), 0))
+    if requester_id != int(OWNER_BROADCAST_USER_ID):
+        print(f"[OWNER NEWS] Unauthorized /release_news attempt by user_id={requester_id}")
+        return
+
+    touch_user_activity_from_update(update, source="release_news_command")
+
+    video_url = " ".join(context.args).strip() if context.args else ""
+    if not video_url:
+        video_url = str(RELEASE_NEWS_VIDEO_URL or "").strip()
+
+    if video_url and not re.match(r"^https?://", video_url, re.IGNORECASE):
+        if video_url.startswith("www."):
+            video_url = f"https://{video_url}"
+        elif video_url.startswith("t.me/"):
+            video_url = f"https://{video_url}"
+
+    if not video_url or not re.match(r"^https?://", video_url, re.IGNORECASE):
+        await message.reply_text(
+            "❌ Ссылка на видео не задана.\n"
+            "Используй: /release_news https://your-video-link",
+            parse_mode="HTML",
+        )
+        return
+
+    recipients = _get_release_news_recipients()
+    if not recipients:
+        await message.reply_text("ℹ️ Получатели не найдены: в user_activity пока нет пользователей.")
+        return
+
+    news_text = _build_release_news_message(video_url)
+    total = len(recipients)
+    delay_seconds = max(1.0 / float(BROADCAST_MESSAGES_PER_SECOND), 0.05)
+    sent = 0
+    failed = 0
+    failed_samples = []
+
+    await message.reply_text(
+        f"🚀 Запускаю рассылку обновления.\n"
+        f"Получателей: <b>{total}</b>\n"
+        f"Видео: {html.escape(video_url)}",
+        parse_mode="HTML",
+    )
+
+    for index, recipient_id in enumerate(recipients, start=1):
+        try:
+            await context.bot.send_message(
+                chat_id=recipient_id,
+                text=news_text,
+                parse_mode="HTML",
+                disable_web_page_preview=False,
+            )
+            sent += 1
+        except Exception as error:
+            failed += 1
+            if len(failed_samples) < 10:
+                failed_samples.append(
+                    html.escape(f"{recipient_id}: {_redact_sensitive_text(error)}")
+                )
+
+        if index < total:
+            await asyncio.sleep(delay_seconds)
+        if index % 300 == 0 or index == total:
+            await message.reply_text(
+                f"📨 Прогресс: {index}/{total} (успешно: {sent}, ошибок: {failed})"
+            )
+
+    summary_lines = [
+        "✅ Рассылка завершена.",
+        f"Отправлено: <b>{sent}</b>",
+        f"Ошибок: <b>{failed}</b>",
+    ]
+    if failed_samples:
+        summary_lines.append("")
+        summary_lines.append("Примеры ошибок:")
+        summary_lines.extend(failed_samples[:5])
+
+    await message.reply_text("\n".join(summary_lines), parse_mode="HTML")
+
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="info_command")
@@ -7552,9 +8036,14 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     "totalDays": int(snapshot.get("total_days", 0) or 0),
                     "daysPassed": int(snapshot.get("days_passed", 0) or 0),
                     "canRenew": bool(snapshot.get("can_renew")),
+                    "canChangePassword": bool(snapshot.get("can_change_password")),
                     "source": str(snapshot.get("source", "")).strip().lower(),
                     "password": str(snapshot.get("password", "")).strip(),
                     "isPermanent": bool(snapshot.get("is_permanent")),
+                    "lastPasswordChangedAt": int(snapshot.get("last_password_change_at", 0) or 0),
+                    "nextPasswordChangeAt": int(snapshot.get("next_password_change_at", 0) or 0),
+                    "passwordChangeSecondsRemaining": int(snapshot.get("password_change_seconds_remaining", 0) or 0),
+                    "passwordChangeCooldownSeconds": int(snapshot.get("password_change_cooldown_seconds", 0) or 0),
                 }
 
             self._send_json(
@@ -7632,6 +8121,216 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                         "isDisabled": bool(result.get("is_disabled")),
                         "isExpired": bool(result.get("is_expired")),
                     },
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/privilege-password-change":
+            try:
+                user_id = int(payload.get("userId", 0))
+            except (TypeError, ValueError):
+                user_id = 0
+            username = str(payload.get("username", "")).strip().lstrip("@")
+            first_name = str(payload.get("firstName", "")).strip()
+            last_name = str(payload.get("lastName", "")).strip()
+            language = str(payload.get("language", "ru")).strip().lower()
+            if language not in {"ru", "uz"}:
+                language = "ru"
+
+            server_id = str(payload.get("serverId", "")).strip()
+            server_name = str(payload.get("serverName", "")).strip()
+            identifier_type = normalize_privilege_identifier_type(payload.get("identifierType", "nickname"))
+            nickname = str(payload.get("nickname", "")).strip()
+            current_password = str(payload.get("currentPassword", "")).strip()
+            new_password = str(payload.get("newPassword", "")).strip()
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="api_privilege_password_change",
+                language=language,
+            )
+
+            if user_id <= 0:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("invalid_user", language)})
+                return
+            if identifier_type != PRIVILEGE_IDENTIFIER_NICKNAME:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("steam_not_supported", language)})
+                return
+            if not server_id or not nickname:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("identifier_required", language)})
+                return
+            if not _is_known_server(server_id):
+                self._send_json(400, {"error": _localize_privilege_password_change_message("unknown_server", language)})
+                return
+            if not current_password:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("current_password_required", language)})
+                return
+            if not new_password:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("new_password_required", language)})
+                return
+
+            try:
+                current_password_safe = _sanitize_password(current_password, field_name="Current password")
+            except ValueError:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("current_password_invalid", language)})
+                return
+
+            try:
+                new_password_safe = _sanitize_password(new_password, field_name="New password")
+            except ValueError:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("new_password_invalid", language)})
+                return
+
+            if new_password_safe == current_password_safe:
+                self._send_json(400, {"error": _localize_privilege_password_change_message("new_password_same", language)})
+                return
+
+            owner = _find_active_privilege_owner(
+                server_id=server_id,
+                server_name=server_name,
+                identifier_type=identifier_type,
+                nickname=nickname,
+                steam_id="",
+            )
+            if not owner:
+                self._send_json(404, {"error": _localize_privilege_password_change_message("account_not_found", language)})
+                return
+            owner_user_id = _safe_int(owner.get("user_id", 0), 0)
+            if owner_user_id > 0 and owner_user_id != user_id:
+                self._send_json(403, {"error": _localize_privilege_password_change_message("account_not_owned", language)})
+                return
+
+            now_ts = int(time.time())
+            last_password_change_at = max(_safe_int(owner.get("last_password_change_at", 0), 0), 0)
+            next_password_change_at = max(
+                _safe_int(owner.get("next_password_change_at", 0), 0),
+                _calculate_privilege_password_change_next_allowed_at(last_password_change_at),
+            )
+            if next_password_change_at > now_ts:
+                self._send_json(
+                    429,
+                    {
+                        "error": _localize_privilege_password_change_message(
+                            "cooldown",
+                            language,
+                            next_allowed_at=next_password_change_at,
+                        ),
+                        "nextAllowedAt": int(next_password_change_at),
+                        "secondsRemaining": int(max(next_password_change_at - now_ts, 0)),
+                        "cooldownSeconds": int(PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS),
+                    },
+                )
+                return
+
+            try:
+                change_result = _change_privilege_password_in_users_ini(
+                    server_id=server_id,
+                    server_name=server_name,
+                    identifier_type=identifier_type,
+                    nickname=nickname,
+                    steam_id="",
+                    current_password=current_password_safe,
+                    new_password=new_password_safe,
+                )
+            except ValueError as error:
+                message_text = str(error or "")
+                if "Current password" in message_text:
+                    self._send_json(400, {"error": _localize_privilege_password_change_message("current_password_invalid", language)})
+                elif "New password" in message_text:
+                    self._send_json(400, {"error": _localize_privilege_password_change_message("new_password_invalid", language)})
+                else:
+                    self._send_json(400, {"error": _localize_privilege_password_change_message("ftp_failed", language)})
+                return
+            except Exception as error:
+                print(f"[PRIVILEGE PASSWORD CHANGE ERROR] {_redact_sensitive_text(error)}", file=sys.stderr)
+                self._send_json(502, {"error": _localize_privilege_password_change_message("ftp_failed", language)})
+                return
+
+            if not bool(change_result.get("supported")):
+                self._send_json(502, {"error": _localize_privilege_password_change_message("ftp_failed", language)})
+                return
+            if not bool(change_result.get("exists")):
+                self._send_json(404, {"error": _localize_privilege_password_change_message("account_not_found", language)})
+                return
+            if bool(change_result.get("is_disabled")):
+                self._send_json(400, {"error": _localize_privilege_password_change_message("account_disabled", language)})
+                return
+            if bool(change_result.get("is_expired")):
+                self._send_json(400, {"error": _localize_privilege_password_change_message("account_expired", language)})
+                return
+            if bool(change_result.get("same_password")):
+                self._send_json(400, {"error": _localize_privilege_password_change_message("new_password_same", language)})
+                return
+            if not bool(change_result.get("valid_current_password")):
+                self._send_json(400, {"error": _localize_privilege_password_change_message("current_password_invalid", language)})
+                return
+            if not bool(change_result.get("changed")):
+                self._send_json(502, {"error": _localize_privilege_password_change_message("ftp_failed", language)})
+                return
+
+            changed_at = int(time.time())
+            next_allowed_at = _calculate_privilege_password_change_next_allowed_at(changed_at)
+            _update_active_privilege_password_metadata(
+                server_id=server_id,
+                server_name=server_name,
+                identifier_type=identifier_type,
+                nickname=nickname,
+                steam_id="",
+                password=new_password_safe,
+                changed_at=changed_at,
+                user_id=user_id,
+            )
+
+            snapshot = _find_user_privilege_snapshot_by_binding(
+                user_id=user_id,
+                server_id=server_id,
+                server_name=server_name,
+                identifier_type=identifier_type,
+                nickname=str(change_result.get("nickname", nickname)).strip(),
+                steam_id="",
+            )
+            snapshot_payload = None
+            if isinstance(snapshot, dict):
+                snapshot_payload = {
+                    "id": str(snapshot.get("id", "")).strip(),
+                    "createdAt": int(snapshot.get("created_at", 0) or 0),
+                    "serverId": str(snapshot.get("server_id", "")).strip(),
+                    "serverName": str(snapshot.get("server_name", "")).strip(),
+                    "privilegeKey": str(snapshot.get("privilege_key", "")).strip(),
+                    "privilegeLabel": str(snapshot.get("privilege_label", "")).strip(),
+                    "identifierType": str(snapshot.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME)),
+                    "nickname": str(snapshot.get("nickname", "")).strip(),
+                    "steamId": str(snapshot.get("steam_id", "")).strip(),
+                    "remainingDays": int(snapshot.get("remaining_days", 0) or 0),
+                    "totalDays": int(snapshot.get("total_days", 0) or 0),
+                    "daysPassed": int(snapshot.get("days_passed", 0) or 0),
+                    "canRenew": bool(snapshot.get("can_renew")),
+                    "canChangePassword": bool(snapshot.get("can_change_password")),
+                    "source": str(snapshot.get("source", "")).strip().lower(),
+                    "password": str(snapshot.get("password", "")).strip(),
+                    "isPermanent": bool(snapshot.get("is_permanent")),
+                    "lastPasswordChangedAt": int(snapshot.get("last_password_change_at", 0) or 0),
+                    "nextPasswordChangeAt": int(snapshot.get("next_password_change_at", 0) or 0),
+                    "passwordChangeSecondsRemaining": int(snapshot.get("password_change_seconds_remaining", 0) or 0),
+                    "passwordChangeCooldownSeconds": int(snapshot.get("password_change_cooldown_seconds", 0) or 0),
+                }
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "changed": True,
+                    "serverId": str(server_id).strip(),
+                    "identifierType": PRIVILEGE_IDENTIFIER_NICKNAME,
+                    "nickname": str(change_result.get("nickname", nickname)).strip(),
+                    "passwordChangedAt": int(changed_at),
+                    "nextAllowedAt": int(next_allowed_at),
+                    "cooldownSeconds": int(PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS),
+                    "privilegeItem": snapshot_payload,
                     "timestamp": int(time.time()),
                 },
             )
@@ -8626,6 +9325,46 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     self._send_json(400, {"error": "Missing required fields"})
                     return
 
+            existing_password_change_at = 0
+            existing_password_change_next_at = 0
+            if identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME and nickname:
+                owner_state = _find_active_privilege_owner(
+                    server_id=server_id,
+                    server_name=server_name,
+                    identifier_type=identifier_type,
+                    nickname=nickname,
+                    steam_id="",
+                )
+                if owner_state:
+                    existing_password_change_at = max(
+                        _safe_int(owner_state.get("last_password_change_at", 0), 0),
+                        0,
+                    )
+                    existing_password_change_next_at = max(
+                        _safe_int(owner_state.get("next_password_change_at", 0), 0),
+                        _calculate_privilege_password_change_next_allowed_at(existing_password_change_at),
+                    )
+
+            if (
+                identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME
+                and bool(change_password)
+                and existing_password_change_next_at > now_ts
+            ):
+                self._send_json(
+                    429,
+                    {
+                        "error": _localize_privilege_password_change_message(
+                            "cooldown",
+                            language,
+                            next_allowed_at=existing_password_change_next_at,
+                        ),
+                        "nextAllowedAt": int(existing_password_change_next_at),
+                        "secondsRemaining": int(max(existing_password_change_next_at - now_ts, 0)),
+                        "cooldownSeconds": int(PRIVILEGE_PASSWORD_CHANGE_COOLDOWN_SECONDS),
+                    },
+                )
+                return
+
             issue_result = None
             try:
                 issue_result = issue_privilege_via_ftp_if_required(
@@ -8690,6 +9429,13 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 if issue_result
                 else (str(password or "").strip() if identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME else "")
             )
+            record_last_password_change_at = int(existing_password_change_at)
+            if (
+                issue_result
+                and identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME
+                and bool(issue_result.get("password_changed"))
+            ):
+                record_last_password_change_at = int(now_ts)
 
             cashback_percent = _get_privilege_cashback_percent(issued_privilege_name)
             cashback_amount = _calculate_privilege_cashback_amount(issued_privilege_name, charged_amount)
@@ -8780,6 +9526,7 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 ),
                 source="purchase",
                 renew_password=effective_record_password,
+                last_password_change_at=record_last_password_change_at,
             )
             purchase_record["payment_verification"] = dict(payment_verification)
             if issue_result:
@@ -9175,9 +9922,14 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                             "totalDays": int(item.get("total_days", 0) or 0),
                             "daysPassed": int(item.get("days_passed", 0) or 0),
                             "canRenew": bool(item.get("can_renew")),
+                            "canChangePassword": bool(item.get("can_change_password")),
                             "source": str(item.get("source", "")).strip().lower(),
                             "password": str(item.get("password", "")).strip(),
                             "isPermanent": bool(item.get("is_permanent")),
+                            "lastPasswordChangedAt": int(item.get("last_password_change_at", 0) or 0),
+                            "nextPasswordChangeAt": int(item.get("next_password_change_at", 0) or 0),
+                            "passwordChangeSecondsRemaining": int(item.get("password_change_seconds_remaining", 0) or 0),
+                            "passwordChangeCooldownSeconds": int(item.get("password_change_cooldown_seconds", 0) or 0),
                         }
                         for item in snapshots
                     ],
@@ -9436,6 +10188,7 @@ def build_application():
     application.add_handler(CommandHandler("info", info))
     application.add_handler(CommandHandler("vip", vip))
     application.add_handler(CommandHandler("miniapp", miniapp))
+    application.add_handler(CommandHandler("release_news", release_news_command))
     application.add_handler(CommandHandler("bind_reports", bind_reports_command))
 
     application.add_handler(MessageHandler(filters.ChatType.GROUPS, group_reports_autobind))

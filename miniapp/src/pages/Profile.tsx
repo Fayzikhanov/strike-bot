@@ -4,11 +4,13 @@ import { useNavigate } from "react-router-dom";
 import { PageTransition } from "../components/PageTransition";
 import { useLanguage } from "../i18n/LanguageContext";
 import {
+  changePrivilegePassword,
   claimWelcomeBonus,
   fetchServers,
   fetchUserBalance,
   fetchUserBalanceHistory,
   submitLegacyPrivilegeImport,
+  verifyPrivilegePassword,
   fetchWelcomeBonusStatus,
   type BalanceHistoryItem,
   type LiveServer,
@@ -89,6 +91,10 @@ function getMetaNumber(meta: Record<string, unknown>, key: string): number {
     return 0;
   }
   return Math.floor(value);
+}
+
+function isValidPrivilegePassword(rawValue: string): boolean {
+  return /^[A-Za-z0-9]{1,20}$/.test(String(rawValue || "").trim());
 }
 
 function buildHistoryTitle(item: BalanceHistoryItem, language: "ru" | "uz"): string {
@@ -234,6 +240,18 @@ export function Profile() {
   const [legacyError, setLegacyError] = useState<string | null>(null);
   const [isSubmittingLegacy, setIsSubmittingLegacy] = useState(false);
   const [legacyImportToast, setLegacyImportToast] = useState<{
+    title: string;
+    details: string;
+  } | null>(null);
+  const [isPasswordModalOpen, setIsPasswordModalOpen] = useState(false);
+  const [passwordTargetItem, setPasswordTargetItem] = useState<UserPrivilegeItem | null>(null);
+  const [currentPrivilegePassword, setCurrentPrivilegePassword] = useState("");
+  const [newPrivilegePassword, setNewPrivilegePassword] = useState("");
+  const [passwordChangeError, setPasswordChangeError] = useState<string | null>(null);
+  const [isVerifyingCurrentPassword, setIsVerifyingCurrentPassword] = useState(false);
+  const [isCurrentPasswordVerified, setIsCurrentPasswordVerified] = useState(false);
+  const [isSubmittingPasswordChange, setIsSubmittingPasswordChange] = useState(false);
+  const [passwordChangeToast, setPasswordChangeToast] = useState<{
     title: string;
     details: string;
   } | null>(null);
@@ -698,6 +716,16 @@ export function Profile() {
     return () => window.clearTimeout(timerId);
   }, [legacyImportToast]);
 
+  useEffect(() => {
+    if (!passwordChangeToast) {
+      return undefined;
+    }
+    const timerId = window.setTimeout(() => {
+      setPasswordChangeToast(null);
+    }, 4200);
+    return () => window.clearTimeout(timerId);
+  }, [passwordChangeToast]);
+
   const availableHistoryMonths = useMemo(() => {
     const monthSet = new Set<string>();
     for (const item of historyItems) {
@@ -733,6 +761,228 @@ export function Profile() {
   const hasMoreHistoryItems = visibleHistoryCount < filteredHistoryItems.length;
   const welcomeBonusAmount = Math.max(0, Number(welcomeBonusStatus?.amount || 10000));
   const shouldShowWelcomeBonusCard = isLoadingWelcomeBonus || !Boolean(welcomeBonusStatus?.claimed);
+
+  const closePasswordChangeModal = useCallback(() => {
+    if (isSubmittingPasswordChange || isVerifyingCurrentPassword) {
+      return;
+    }
+    setIsPasswordModalOpen(false);
+    setPasswordTargetItem(null);
+    setCurrentPrivilegePassword("");
+    setNewPrivilegePassword("");
+    setIsCurrentPasswordVerified(false);
+    setPasswordChangeError(null);
+  }, [isSubmittingPasswordChange, isVerifyingCurrentPassword]);
+
+  const openPasswordChangeModal = useCallback((item: UserPrivilegeItem) => {
+    const canChangePassword = Boolean(
+      item.canChangePassword ??
+      (item.identifierType === "nickname" && item.serverId && item.nickname),
+    );
+    if (!canChangePassword) {
+      return;
+    }
+    setPasswordTargetItem(item);
+    setCurrentPrivilegePassword("");
+    setNewPrivilegePassword("");
+    setIsCurrentPasswordVerified(false);
+    setPasswordChangeError(null);
+    setIsPasswordModalOpen(true);
+  }, []);
+
+  const handleVerifyCurrentPassword = useCallback(async () => {
+    if (!passwordTargetItem) {
+      setPasswordChangeError(
+        isUz
+          ? "Faol imtiyoz topilmadi."
+          : "Активная привилегия не найдена.",
+      );
+      return;
+    }
+    const currentPasswordSafe = currentPrivilegePassword.trim();
+    if (!isValidPrivilegePassword(currentPasswordSafe)) {
+      setPasswordChangeError(
+        isUz
+          ? "Joriy parol noto'g'ri formatda (A-Z, a-z, 0-9, 1-20)."
+          : "Неверный формат текущего пароля (A-Z, a-z, 0-9, 1-20).",
+      );
+      return;
+    }
+
+    setIsVerifyingCurrentPassword(true);
+    setPasswordChangeError(null);
+    try {
+      const verification = await verifyPrivilegePassword(
+        passwordTargetItem.serverId,
+        passwordTargetItem.nickname,
+        currentPasswordSafe,
+        passwordTargetItem.serverName,
+      );
+      if (!verification.valid) {
+        setIsCurrentPasswordVerified(false);
+        setPasswordChangeError(
+          isUz
+            ? "Joriy parol noto'g'ri."
+            : "Текущий пароль неверный.",
+        );
+        return;
+      }
+      setIsCurrentPasswordVerified(true);
+      setPasswordChangeError(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      setIsCurrentPasswordVerified(false);
+      setPasswordChangeError(
+        message || (isUz ? "Parolni tekshirib bo'lmadi." : "Не удалось проверить пароль."),
+      );
+    } finally {
+      setIsVerifyingCurrentPassword(false);
+    }
+  }, [currentPrivilegePassword, isUz, passwordTargetItem]);
+
+  const handlePrivilegePasswordChangeSubmit = useCallback(async () => {
+    if (telegramUserId <= 0) {
+      setPasswordChangeError(
+        isUz
+          ? "Telegram foydalanuvchisini aniqlab bo'lmadi."
+          : "Не удалось определить Telegram пользователя.",
+      );
+      return;
+    }
+    if (!passwordTargetItem) {
+      setPasswordChangeError(
+        isUz
+          ? "Faol imtiyoz topilmadi."
+          : "Активная привилегия не найдена.",
+      );
+      return;
+    }
+
+    const canChangePassword = Boolean(
+      passwordTargetItem.canChangePassword ??
+      (passwordTargetItem.identifierType === "nickname" && passwordTargetItem.serverId && passwordTargetItem.nickname),
+    );
+    if (!canChangePassword) {
+      setPasswordChangeError(
+        isUz
+          ? "Bu imtiyoz uchun parolni almashtirib bo'lmaydi."
+          : "Для этой привилегии смена пароля недоступна.",
+      );
+      return;
+    }
+
+    const currentPasswordSafe = currentPrivilegePassword.trim();
+    const newPasswordSafe = newPrivilegePassword.trim();
+    if (!isValidPrivilegePassword(currentPasswordSafe)) {
+      setPasswordChangeError(
+        isUz
+          ? "Joriy parol noto'g'ri formatda (A-Z, a-z, 0-9, 1-20)."
+          : "Неверный формат текущего пароля (A-Z, a-z, 0-9, 1-20).",
+      );
+      return;
+    }
+    if (!isValidPrivilegePassword(newPasswordSafe)) {
+      setPasswordChangeError(
+        isUz
+          ? "Yangi parol noto'g'ri formatda (A-Z, a-z, 0-9, 1-20)."
+          : "Неверный формат нового пароля (A-Z, a-z, 0-9, 1-20).",
+      );
+      return;
+    }
+    if (newPasswordSafe === currentPasswordSafe) {
+      setPasswordChangeError(
+        isUz
+          ? "Yangi parol joriy paroldan farq qilishi kerak."
+          : "Новый пароль должен отличаться от текущего.",
+      );
+      return;
+    }
+    if (!isCurrentPasswordVerified) {
+      setPasswordChangeError(
+        isUz
+          ? "Avval joriy parolni tekshiring."
+          : "Сначала подтвердите текущий пароль.",
+      );
+      return;
+    }
+
+    setIsSubmittingPasswordChange(true);
+    setPasswordChangeError(null);
+    try {
+      const response = await changePrivilegePassword({
+        userId: telegramUserId,
+        username: user?.username,
+        firstName: user?.first_name,
+        lastName: user?.last_name,
+        serverId: passwordTargetItem.serverId,
+        serverName: passwordTargetItem.serverName,
+        identifierType: "nickname",
+        nickname: passwordTargetItem.nickname,
+        currentPassword: currentPasswordSafe,
+        newPassword: newPasswordSafe,
+        language,
+      });
+
+      const nowSeconds = Math.floor(Date.now() / 1000);
+      const fallbackItem: UserPrivilegeItem = {
+        ...passwordTargetItem,
+        password: newPasswordSafe,
+        canChangePassword: true,
+        lastPasswordChangedAt: Number(response.passwordChangedAt || 0),
+        nextPasswordChangeAt: Number(response.nextAllowedAt || 0),
+        passwordChangeCooldownSeconds: Number(response.cooldownSeconds || 0),
+        passwordChangeSecondsRemaining: Math.max(
+          Number(response.nextAllowedAt || 0) - nowSeconds,
+          0,
+        ),
+      };
+      const updatedItem = response.privilegeItem ?? fallbackItem;
+
+      setPrivilegeItems((current) => current.map((item) => (
+        item.id === passwordTargetItem.id
+          ? updatedItem
+          : item
+      )));
+
+      const nextAllowedAt = Number(response.nextAllowedAt || 0);
+      const nextAllowedText = nextAllowedAt > 0
+        ? formatDateTime(nextAllowedAt, language)
+        : "-";
+      setPasswordChangeToast({
+        title: isUz ? "Parol yangilandi" : "Пароль обновлён",
+        details: isUz
+          ? `Keyingi almashtirish: ${nextAllowedText}`
+          : `Следующая смена: ${nextAllowedText}`,
+      });
+
+      setIsPasswordModalOpen(false);
+      setPasswordTargetItem(null);
+      setCurrentPrivilegePassword("");
+      setNewPrivilegePassword("");
+      setIsCurrentPasswordVerified(false);
+      setPasswordChangeError(null);
+      await loadPrivileges(false);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      setPasswordChangeError(
+        message || (isUz ? "Parolni almashtirib bo'lmadi." : "Не удалось сменить пароль."),
+      );
+    } finally {
+      setIsSubmittingPasswordChange(false);
+    }
+  }, [
+    currentPrivilegePassword,
+    isUz,
+    language,
+    loadPrivileges,
+    newPrivilegePassword,
+    passwordTargetItem,
+    isCurrentPasswordVerified,
+    telegramUserId,
+    user?.first_name,
+    user?.last_name,
+    user?.username,
+  ]);
 
   const handleRenewPrivilege = (item: UserPrivilegeItem) => {
     if (!item.canRenew || !item.serverId || !item.privilegeKey) {
@@ -926,6 +1176,33 @@ export function Profile() {
                   const identifierValue = item.identifierType === "steam"
                     ? item.steamId
                     : item.nickname;
+                  const canChangePassword = Boolean(
+                    item.canChangePassword ??
+                    (item.identifierType === "nickname" && item.serverId && item.nickname),
+                  );
+                  const nextPasswordChangeAt = Math.max(0, Number(item.nextPasswordChangeAt || 0));
+                  const nowSeconds = Math.floor(Date.now() / 1000);
+                  const fallbackPasswordChangeSeconds = nextPasswordChangeAt > 0
+                    ? Math.max(nextPasswordChangeAt - nowSeconds, 0)
+                    : 0;
+                  const passwordChangeSecondsRemaining = Math.max(
+                    0,
+                    Number(item.passwordChangeSecondsRemaining ?? fallbackPasswordChangeSeconds),
+                  );
+                  const isPasswordCooldownActive = canChangePassword && passwordChangeSecondsRemaining > 0;
+                  const passwordChangeInfoText = canChangePassword
+                    ? (
+                        isPasswordCooldownActive
+                          ? (isUz
+                            ? `Parolni ${formatDateTime(nextPasswordChangeAt, language)} dan keyin almashtirish mumkin.`
+                            : `Пароль можно сменить после ${formatDateTime(nextPasswordChangeAt, language)}.`)
+                          : (isUz ? "Parolni hozir almashtirish mumkin." : "Пароль можно сменить сейчас.")
+                      )
+                    : (
+                        item.identifierType === "steam"
+                          ? (isUz ? "STEAM_ID rejimida parol ishlatilmaydi." : "В режиме STEAM_ID пароль не используется.")
+                          : (isUz ? "Parolni almashtirish hozircha mavjud emas." : "Смена пароля сейчас недоступна.")
+                      );
                   return (
                     <div
                       key={item.id}
@@ -964,18 +1241,35 @@ export function Profile() {
                           style={{ width: `${progressPercent}%` }}
                         />
                       </div>
-                      <button
-                        type="button"
-                        disabled={!item.canRenew}
-                        onClick={() => handleRenewPrivilege(item)}
-                        className={`mt-3 w-full rounded-lg border px-3 py-2 text-xs font-black uppercase tracking-wide transition-colors ${
-                          item.canRenew
-                            ? "bg-[#F08800]/12 border-[#F08800]/60 text-[#F8B24E]"
-                            : "bg-[#1a1a1a] border-[#2a2a2a] text-[#6a6a6a] cursor-not-allowed"
-                        }`}
-                      >
-                        {isUz ? "Imtiyozni uzaytirish" : "Продлить привилегию"}
-                      </button>
+                      <p className="text-[#8f8f8f] text-[11px] mt-2 leading-relaxed">{passwordChangeInfoText}</p>
+                      <div className="grid grid-cols-2 gap-2 mt-3">
+                        <button
+                          type="button"
+                          disabled={!item.canRenew}
+                          onClick={() => handleRenewPrivilege(item)}
+                          className={`rounded-lg border px-3 py-2 text-xs font-black uppercase tracking-wide transition-colors ${
+                            item.canRenew
+                              ? "bg-[#F08800]/12 border-[#F08800]/60 text-[#F8B24E]"
+                              : "bg-[#1a1a1a] border-[#2a2a2a] text-[#6a6a6a] cursor-not-allowed"
+                          }`}
+                        >
+                          {isUz ? "Uzatish" : "Продлить"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={!canChangePassword || isPasswordCooldownActive}
+                          onClick={() => openPasswordChangeModal(item)}
+                          className={`rounded-lg border px-3 py-2 text-xs font-black uppercase tracking-wide transition-colors ${
+                            canChangePassword && !isPasswordCooldownActive
+                              ? "bg-[#2563eb]/15 border-[#3b82f6]/60 text-[#93c5fd]"
+                              : "bg-[#1a1a1a] border-[#2a2a2a] text-[#6a6a6a] cursor-not-allowed"
+                          }`}
+                        >
+                          {item.identifierType === "steam"
+                            ? (isUz ? "STEAM mode" : "STEAM режим")
+                            : (isUz ? "Parolni almashtirish" : "Сменить пароль")}
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
@@ -1101,6 +1395,145 @@ export function Profile() {
           </div>
         </div>
       </div>
+
+      {isPasswordModalOpen && (
+        <div className="fixed inset-0 z-[131] bg-black/70 backdrop-blur-sm px-3 py-6 overflow-y-auto">
+          <div className="max-w-[460px] mx-auto bg-[#121212] border border-[#2a2a2a] rounded-2xl p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-[#FCFCFC] text-lg font-black">
+                  {isUz ? "Parolni almashtirish" : "Смена пароля"}
+                </h3>
+                <p className="text-[#8e8e8e] text-xs mt-1">
+                  {passwordTargetItem?.serverName || "-"} • {passwordTargetItem?.nickname || "-"}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={isSubmittingPasswordChange || isVerifyingCurrentPassword}
+                onClick={closePasswordChangeModal}
+                className="rounded-lg border border-[#303030] bg-[#1b1b1b] px-2.5 py-1.5 text-[#a8a8a8] text-xs font-bold uppercase tracking-wide disabled:opacity-60"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-3">
+              <div className="rounded-lg border border-[#2a2a2a] bg-[#161616] p-3 text-[12px] text-[#a5a5a5]">
+                <p>
+                  {isUz ? "Server" : "Сервер"}:{" "}
+                  <span className="text-[#FCFCFC]">{passwordTargetItem?.serverName || "-"}</span>
+                </p>
+                <p className="mt-1">
+                  Nick:{" "}
+                  <span className="text-[#FCFCFC]">{passwordTargetItem?.nickname || "-"}</span>
+                </p>
+                {Number(passwordTargetItem?.nextPasswordChangeAt || 0) > 0 && (
+                  <p className="mt-1">
+                    {isUz ? "Keyingi almashtirish" : "Следующая смена"}:{" "}
+                    <span className="text-[#FCFCFC]">
+                      {formatDateTime(Number(passwordTargetItem?.nextPasswordChangeAt || 0), language)}
+                    </span>
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <p className="text-[#cfcfcf] text-xs mb-1.5">
+                  {isUz ? "Joriy parol" : "Текущий пароль"}
+                </p>
+                <input
+                  type="password"
+                  value={currentPrivilegePassword}
+                  onChange={(event) => {
+                    setCurrentPrivilegePassword(event.target.value);
+                    setIsCurrentPasswordVerified(false);
+                    setPasswordChangeError(null);
+                  }}
+                  autoComplete="off"
+                  spellCheck={false}
+                  placeholder={isUz ? "Joriy parol" : "Введите текущий пароль"}
+                  className="w-full bg-[#121212] border border-[#2a2a2a] rounded-lg px-3 py-2.5 text-[#FCFCFC] text-sm focus:outline-none focus:border-[#F08800]"
+                />
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleVerifyCurrentPassword}
+                    disabled={isVerifyingCurrentPassword || isSubmittingPasswordChange}
+                    className="rounded-lg border border-[#F08800] bg-[#F08800]/15 px-3 py-2 text-[11px] font-black uppercase tracking-wide text-[#F8B24E] disabled:opacity-60"
+                  >
+                    {isVerifyingCurrentPassword
+                      ? (isUz ? "Tekshirilmoqda..." : "Проверка...")
+                      : (isUz ? "Parolni tekshirish" : "Проверить пароль")}
+                  </button>
+                  {isCurrentPasswordVerified && (
+                    <span className="text-[11px] font-bold text-[#86efac]">
+                      {isUz ? "Parol tasdiqlandi" : "Пароль подтверждён"}
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              {isCurrentPasswordVerified ? (
+                <div>
+                  <p className="text-[#cfcfcf] text-xs mb-1.5">
+                    {isUz ? "Yangi parol" : "Новый пароль"}
+                  </p>
+                  <input
+                    type="password"
+                    value={newPrivilegePassword}
+                    onChange={(event) => {
+                      setNewPrivilegePassword(event.target.value);
+                      setPasswordChangeError(null);
+                    }}
+                    autoComplete="new-password"
+                    spellCheck={false}
+                    placeholder={isUz ? "Yangi parol (A-Z, a-z, 0-9)" : "Новый пароль (A-Z, a-z, 0-9)"}
+                    className="w-full bg-[#121212] border border-[#2a2a2a] rounded-lg px-3 py-2.5 text-[#FCFCFC] text-sm focus:outline-none focus:border-[#F08800]"
+                  />
+                  <p className="text-[#8f8f8f] text-xs leading-relaxed mt-1.5">
+                    {isUz
+                      ? "Parol faqat A-Z, a-z, 0-9 va 1-20 belgidan iborat bo'lishi kerak."
+                      : "Пароль: только A-Z, a-z, 0-9, длина 1-20 символов."}
+                  </p>
+                </div>
+              ) : (
+                <p className="text-[#8f8f8f] text-xs leading-relaxed">
+                  {isUz
+                    ? "Yangi parolni kiritishdan oldin joriy parolni tekshiring."
+                    : "Сначала подтвердите текущий пароль, затем будет доступен ввод нового пароля."}
+                </p>
+              )}
+            </div>
+
+            {passwordChangeError && (
+              <div className="mt-4 rounded-lg border border-[#ef4444]/40 bg-[#2d1313] px-3 py-2 text-[#fca5a5] text-xs">
+                {passwordChangeError}
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2 mt-4">
+              <button
+                type="button"
+                onClick={closePasswordChangeModal}
+                disabled={isSubmittingPasswordChange}
+                className="rounded-lg border border-[#2a2a2a] bg-[#1b1b1b] py-2.5 text-[#d0d0d0] text-xs font-black uppercase tracking-wide disabled:opacity-60"
+              >
+                {isUz ? "Bekor qilish" : "Отмена"}
+              </button>
+              <button
+                type="button"
+                onClick={handlePrivilegePasswordChangeSubmit}
+                disabled={isSubmittingPasswordChange || !isCurrentPasswordVerified}
+                className="rounded-lg border border-[#3b82f6] bg-[#3b82f6] py-2.5 text-[#dbeafe] text-xs font-black uppercase tracking-wide disabled:opacity-60 inline-flex items-center justify-center gap-2"
+              >
+                {isSubmittingPasswordChange && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                {isUz ? "Parolni saqlash" : "Сохранить пароль"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {isLegacyModalOpen && (
         <div className="fixed inset-0 z-[130] bg-black/70 backdrop-blur-sm px-3 py-6 overflow-y-auto">
@@ -1329,6 +1762,15 @@ export function Profile() {
           <div className="rounded-2xl border border-[#22c55e]/70 bg-gradient-to-br from-[#0f2a1b] to-[#0a2014] px-4 py-3 shadow-[0_12px_36px_rgba(34,197,94,0.3)]">
             <p className="text-[#dcfce7] text-sm font-black">{legacyImportToast.title}</p>
             <p className="text-[#9feebf] text-xs mt-1.5 leading-relaxed">{legacyImportToast.details}</p>
+          </div>
+        </div>
+      )}
+
+      {passwordChangeToast && (
+        <div className="fixed left-3 right-3 top-20 z-[132] max-w-[460px] mx-auto">
+          <div className="rounded-2xl border border-[#3b82f6]/70 bg-gradient-to-br from-[#10203d] to-[#0a172b] px-4 py-3 shadow-[0_12px_36px_rgba(59,130,246,0.3)]">
+            <p className="text-[#dbeafe] text-sm font-black">{passwordChangeToast.title}</p>
+            <p className="text-[#93c5fd] text-xs mt-1.5 leading-relaxed">{passwordChangeToast.details}</p>
           </div>
         </div>
       )}

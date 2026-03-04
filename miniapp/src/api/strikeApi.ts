@@ -132,9 +132,14 @@ export interface UserPrivilegeItem {
   totalDays: number;
   daysPassed: number;
   canRenew: boolean;
+  canChangePassword?: boolean;
   source?: string;
   password?: string;
   isPermanent?: boolean;
+  lastPasswordChangedAt?: number;
+  nextPasswordChangeAt?: number;
+  passwordChangeSecondsRemaining?: number;
+  passwordChangeCooldownSeconds?: number;
 }
 
 export interface UserPrivilegesResponse {
@@ -565,6 +570,33 @@ export interface LegacyPrivilegeImportResponse {
     totalDays: number;
     isPermanent?: boolean;
   };
+  privilegeItem: UserPrivilegeItem | null;
+  timestamp: number;
+}
+
+export interface PrivilegePasswordChangePayload {
+  userId: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  serverId: string;
+  serverName?: string;
+  identifierType?: "nickname";
+  nickname: string;
+  currentPassword: string;
+  newPassword: string;
+  language: "ru" | "uz";
+}
+
+export interface PrivilegePasswordChangeResponse {
+  ok: boolean;
+  changed: boolean;
+  serverId: string;
+  identifierType: "nickname";
+  nickname: string;
+  passwordChangedAt: number;
+  nextAllowedAt: number;
+  cooldownSeconds: number;
   privilegeItem: UserPrivilegeItem | null;
   timestamp: number;
 }
@@ -1115,6 +1147,12 @@ export async function verifyPrivilegePassword(
     password,
     serverName,
   });
+}
+
+export async function changePrivilegePassword(
+  payload: PrivilegePasswordChangePayload,
+): Promise<PrivilegePasswordChangeResponse> {
+  return postJson<PrivilegePasswordChangeResponse>("/api/privilege-password-change", payload);
 }
 
 export async function notifyPurchaseConfirmed(
