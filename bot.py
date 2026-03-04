@@ -5997,10 +5997,14 @@ def get_server_info(port):
         "max": 0,
     }
 
-def main_inline_keyboard():
+def main_inline_keyboard(chat_type="private"):
     _url = get_web_app_url()
+    safe_chat_type = str(chat_type or "").strip().lower()
+    is_group_chat = safe_chat_type in {"group", "supergroup"}
     app_button = (
-        InlineKeyboardButton("📱 App", web_app=WebAppInfo(url=_url))
+        InlineKeyboardButton("📱 App", url=_url)
+        if (_url and is_group_chat)
+        else InlineKeyboardButton("📱 App", web_app=WebAppInfo(url=_url))
         if _url
         else InlineKeyboardButton("📱 App", callback_data="menu_app_unavailable")
     )
@@ -6016,9 +6020,10 @@ def main_inline_keyboard():
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="menu_command")
+    chat_type = update.effective_chat.type if update.effective_chat else ""
     await update.message.reply_text(
         "🎮 <b>Strike.Uz меню</b>",
-        reply_markup=main_inline_keyboard(),
+        reply_markup=main_inline_keyboard(chat_type),
         parse_mode="HTML"
     )
 
@@ -6126,7 +6131,8 @@ async def players_server_callback(update: Update, context: ContextTypes.DEFAULT_
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="start_command")
-    if update.message.chat.type == "private":
+    chat_type = update.message.chat.type if update.message else ""
+    if chat_type == "private":
         await ensure_chat_menu_button_for_chat(context.bot, update.message.chat.id)
         await update.message.reply_text(
             START_TEXT,
@@ -6142,7 +6148,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/info — Информация\n"
             "/vip — VIP",
             parse_mode="HTML",
-            reply_markup=main_inline_keyboard() 
+            reply_markup=main_inline_keyboard(chat_type)
         )
 
 
