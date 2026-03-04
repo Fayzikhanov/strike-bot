@@ -6317,7 +6317,6 @@ def _get_monitoring_servers_snapshot(force=False):
         cached_timestamp = float(MONITORING_CACHE.get("timestamp", 0.0) or 0.0)
         if (
             not force
-            and cached_servers
             and (now - cached_timestamp) < MONITORING_CACHE_TTL_SECONDS
         ):
             return cached_servers
