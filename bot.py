@@ -105,6 +105,10 @@ ADMIN_DASHBOARD_KEY = os.getenv("ADMIN_DASHBOARD_KEY", "").strip()
 OWNER_BROADCAST_USER_ID = max(_env_int("OWNER_BROADCAST_USER_ID", 829988791), 0)
 RELEASE_NEWS_VIDEO_URL = os.getenv("RELEASE_NEWS_VIDEO_URL", "").strip()
 WELCOME_BONUS_AMOUNT = max(_env_int("WELCOME_BONUS_AMOUNT", 10000), 0)
+AUTO_RELEASE_BROADCAST_ENABLED = str(
+    os.getenv("AUTO_RELEASE_BROADCAST_ENABLED", "1")
+).strip().lower() not in {"0", "false", "no"}
+AUTO_RELEASE_BROADCAST_KEY = str(os.getenv("AUTO_RELEASE_BROADCAST_KEY", "")).strip()
 ADMIN_DEFAULT_PAGE_SIZE = max(_env_int("ADMIN_DEFAULT_PAGE_SIZE", 30), 1)
 ADMIN_MAX_PAGE_SIZE = max(_env_int("ADMIN_MAX_PAGE_SIZE", 100), ADMIN_DEFAULT_PAGE_SIZE)
 USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS = max(_env_int("USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS", 45), 0)
@@ -340,9 +344,18 @@ def _build_default_reports_store():
         "balance_transactions": [],
         "welcome_bonus_claims": {},
         "user_activity": {},
+        "known_group_chats": {},
         "payment_attempts": {},
         "payment_user_violations": {},
         "broadcast_campaigns": [],
+        "release_broadcast": {
+            "last_release_key": "",
+            "last_sent_at": 0,
+            "private_sent": 0,
+            "private_failed": 0,
+            "group_sent": 0,
+            "group_failed": 0,
+        },
         "last_reports": {
             "daily": "",
             "weekly": "",
@@ -395,6 +408,10 @@ def _load_reports_store():
     if isinstance(user_activity, dict):
         store["user_activity"] = user_activity
 
+    known_group_chats = loaded.get("known_group_chats", {})
+    if isinstance(known_group_chats, dict):
+        store["known_group_chats"] = known_group_chats
+
     payment_attempts = loaded.get("payment_attempts", {})
     if isinstance(payment_attempts, dict):
         store["payment_attempts"] = payment_attempts
@@ -406,6 +423,10 @@ def _load_reports_store():
     broadcast_campaigns = loaded.get("broadcast_campaigns", [])
     if isinstance(broadcast_campaigns, list):
         store["broadcast_campaigns"] = broadcast_campaigns
+
+    release_broadcast = loaded.get("release_broadcast", {})
+    if isinstance(release_broadcast, dict):
+        store["release_broadcast"] = release_broadcast
 
     last_reports = loaded.get("last_reports", {})
     if isinstance(last_reports, dict):
@@ -433,6 +454,7 @@ BROADCAST_RUNTIME_LOCK = threading.Lock()
 BROADCAST_QUEUE = deque()
 BROADCAST_PREVIEWS = {}
 BROADCAST_WORKER_STARTED = False
+AUTO_RELEASE_BROADCAST_STARTED = False
 
 
 def _save_reports_store_locked():
@@ -457,6 +479,19 @@ def bind_reports_chat(chat_id, chat_title=""):
     with REPORTS_LOCK:
         REPORTS_STORE["reports_chat_id"] = normalized_chat_id
         REPORTS_STORE["reports_chat_title"] = str(chat_title or "").strip()
+        if int(normalized_chat_id) < 0:
+            groups = REPORTS_STORE.setdefault("known_group_chats", {})
+            if not isinstance(groups, dict):
+                groups = {}
+                REPORTS_STORE["known_group_chats"] = groups
+            group_key = str(int(normalized_chat_id))
+            current_group = _normalize_group_chat_activity_record(groups.get(group_key))
+            groups[group_key] = {
+                "last_activity_at": int(time.time()),
+                "title": str(chat_title or "").strip() or str(current_group.get("title", "")).strip(),
+                "chat_type": str(current_group.get("chat_type", "")).strip() or "group",
+                "source": "bind_reports",
+            }
         _save_reports_store_locked()
     return True
 
@@ -825,6 +860,80 @@ def _safe_int(value, default=0):
         return int(default)
 
 
+def _normalize_group_chat_activity_record(raw_value):
+    if not isinstance(raw_value, dict):
+        return {
+            "last_activity_at": 0,
+            "title": "",
+            "chat_type": "",
+            "source": "",
+        }
+    safe_chat_type = str(raw_value.get("chat_type", "")).strip().lower()
+    if safe_chat_type not in {"group", "supergroup"}:
+        safe_chat_type = ""
+    return {
+        "last_activity_at": max(_safe_int(raw_value.get("last_activity_at", 0), 0), 0),
+        "title": str(raw_value.get("title", "")).strip(),
+        "chat_type": safe_chat_type,
+        "source": str(raw_value.get("source", "")).strip(),
+    }
+
+
+def touch_group_chat_activity(
+    chat_id,
+    *,
+    chat_title="",
+    chat_type="",
+    source="",
+    timestamp=0,
+):
+    safe_chat_id = _safe_int(chat_id, 0)
+    safe_chat_type = str(chat_type or "").strip().lower()
+    if safe_chat_id >= 0:
+        return None
+    if safe_chat_type not in {"group", "supergroup"}:
+        return None
+
+    now_ts = max(_safe_int(timestamp, 0), int(time.time()))
+    chat_key = str(safe_chat_id)
+    safe_title = str(chat_title or "").strip()
+    safe_source = str(source or "").strip()
+
+    with REPORTS_LOCK:
+        groups = REPORTS_STORE.setdefault("known_group_chats", {})
+        if not isinstance(groups, dict):
+            groups = {}
+            REPORTS_STORE["known_group_chats"] = groups
+
+        current = _normalize_group_chat_activity_record(groups.get(chat_key))
+        updated = dict(current)
+        should_save = False
+
+        if (
+            current.get("last_activity_at", 0) <= 0
+            or now_ts - int(current.get("last_activity_at", 0)) >= USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS
+        ):
+            updated["last_activity_at"] = now_ts
+            should_save = True
+
+        if safe_title and safe_title != current.get("title", ""):
+            updated["title"] = safe_title
+            should_save = True
+
+        if safe_chat_type and safe_chat_type != current.get("chat_type", ""):
+            updated["chat_type"] = safe_chat_type
+            should_save = True
+
+        if safe_source and safe_source != current.get("source", ""):
+            updated["source"] = safe_source
+            should_save = True
+
+        if should_save:
+            groups[chat_key] = updated
+            _save_reports_store_locked()
+        return dict(updated)
+
+
 def _normalize_user_activity_record(raw_value):
     if not isinstance(raw_value, dict):
         return {
@@ -913,6 +1022,15 @@ def touch_user_activity(
 
 
 def touch_user_activity_from_update(update, *, source=""):
+    chat = update.effective_chat if update else None
+    if chat and str(getattr(chat, "type", "")).strip().lower() in {"group", "supergroup"}:
+        touch_group_chat_activity(
+            getattr(chat, "id", 0),
+            chat_title=getattr(chat, "title", "") or "",
+            chat_type=getattr(chat, "type", "") or "",
+            source=source,
+        )
+
     user = update.effective_user if update else None
     if not user:
         return None
@@ -4966,6 +5084,337 @@ def _get_release_news_recipients():
     return recipients
 
 
+def _normalize_release_broadcast_state(raw_value):
+    if not isinstance(raw_value, dict):
+        return {
+            "last_release_key": "",
+            "last_sent_at": 0,
+            "private_sent": 0,
+            "private_failed": 0,
+            "group_sent": 0,
+            "group_failed": 0,
+        }
+    return {
+        "last_release_key": str(raw_value.get("last_release_key", "")).strip(),
+        "last_sent_at": max(_safe_int(raw_value.get("last_sent_at", 0), 0), 0),
+        "private_sent": max(_safe_int(raw_value.get("private_sent", 0), 0), 0),
+        "private_failed": max(_safe_int(raw_value.get("private_failed", 0), 0), 0),
+        "group_sent": max(_safe_int(raw_value.get("group_sent", 0), 0), 0),
+        "group_failed": max(_safe_int(raw_value.get("group_failed", 0), 0), 0),
+    }
+
+
+def _get_release_broadcast_state_snapshot():
+    with REPORTS_LOCK:
+        safe_state = _normalize_release_broadcast_state(
+            REPORTS_STORE.setdefault("release_broadcast", {})
+        )
+        REPORTS_STORE["release_broadcast"] = dict(safe_state)
+        return dict(safe_state)
+
+
+def _save_release_broadcast_state(state_updates):
+    updates = state_updates if isinstance(state_updates, dict) else {}
+    with REPORTS_LOCK:
+        current = _normalize_release_broadcast_state(
+            REPORTS_STORE.setdefault("release_broadcast", {})
+        )
+        merged = dict(current)
+        if "last_release_key" in updates:
+            merged["last_release_key"] = str(updates.get("last_release_key", "")).strip()
+        if "last_sent_at" in updates:
+            merged["last_sent_at"] = max(_safe_int(updates.get("last_sent_at", 0), 0), 0)
+        if "private_sent" in updates:
+            merged["private_sent"] = max(_safe_int(updates.get("private_sent", 0), 0), 0)
+        if "private_failed" in updates:
+            merged["private_failed"] = max(_safe_int(updates.get("private_failed", 0), 0), 0)
+        if "group_sent" in updates:
+            merged["group_sent"] = max(_safe_int(updates.get("group_sent", 0), 0), 0)
+        if "group_failed" in updates:
+            merged["group_failed"] = max(_safe_int(updates.get("group_failed", 0), 0), 0)
+        REPORTS_STORE["release_broadcast"] = dict(merged)
+        _save_reports_store_locked()
+        return dict(merged)
+
+
+def _extract_release_version_from_url(raw_url):
+    safe_url = str(raw_url or "").strip()
+    if not safe_url:
+        return ""
+    try:
+        parsed = urlparse(safe_url)
+    except Exception:
+        return ""
+    raw_version = str(parse_qs(parsed.query).get("v", [""])[0]).strip()
+    if not raw_version:
+        return ""
+    return re.sub(r"[^A-Za-z0-9._:-]", "", raw_version)[:64]
+
+
+def _read_git_commit_short():
+    git_dir = os.path.join(os.path.dirname(__file__), ".git")
+    head_path = os.path.join(git_dir, "HEAD")
+    try:
+        with open(head_path, "r", encoding="utf-8") as source:
+            head_value = source.read().strip()
+    except Exception:
+        return ""
+
+    commit_hash = ""
+    if head_value.startswith("ref:"):
+        ref_name = head_value[4:].strip()
+        ref_path = os.path.join(git_dir, *ref_name.split("/"))
+        try:
+            with open(ref_path, "r", encoding="utf-8") as source:
+                commit_hash = source.read().strip()
+        except Exception:
+            commit_hash = ""
+    else:
+        commit_hash = head_value
+
+    safe_hash = re.sub(r"[^0-9a-fA-F]", "", str(commit_hash))[:12].lower()
+    return safe_hash
+
+
+def _build_auto_release_broadcast_key():
+    if AUTO_RELEASE_BROADCAST_KEY:
+        return re.sub(r"[^A-Za-z0-9._:-]", "", AUTO_RELEASE_BROADCAST_KEY)[:96]
+
+    web_app_url = get_web_app_url()
+    commit_hash = _read_git_commit_short()
+    version = _extract_release_version_from_url(web_app_url)
+    parts = []
+    if commit_hash:
+        parts.append(commit_hash)
+    if version:
+        parts.append(version)
+    if parts:
+        return ":".join(parts)
+    if web_app_url:
+        return hashlib.sha1(web_app_url.encode("utf-8")).hexdigest()[:12]
+    return ""
+
+
+def _get_auto_release_private_recipients():
+    with REPORTS_LOCK:
+        user_activity = REPORTS_STORE.get("user_activity")
+        if not isinstance(user_activity, dict):
+            return []
+        items = list(user_activity.items())
+
+    recipients = []
+    seen = set()
+    for raw_user_id, raw_activity in items:
+        safe_user_id = _safe_int(raw_user_id, 0)
+        if safe_user_id <= 0 or safe_user_id in seen:
+            continue
+        seen.add(safe_user_id)
+        activity = _normalize_user_activity_record(raw_activity)
+        language = _normalize_broadcast_language(activity.get("language", "ru"))
+        if language not in {"ru", "uz"}:
+            language = "ru"
+        recipients.append(
+            {
+                "chat_id": int(safe_user_id),
+                "language": language,
+            }
+        )
+
+    recipients.sort(key=lambda item: int(item.get("chat_id", 0)))
+    return recipients
+
+
+def _get_auto_release_group_recipients():
+    with REPORTS_LOCK:
+        raw_groups = REPORTS_STORE.get("known_group_chats")
+        groups = dict(raw_groups) if isinstance(raw_groups, dict) else {}
+        reports_chat_id = _normalize_chat_id(REPORTS_STORE.get("reports_chat_id"))
+
+    recipient_map = {}
+    for raw_chat_id, raw_record in groups.items():
+        safe_chat_id = _safe_int(raw_chat_id, 0)
+        if safe_chat_id >= 0:
+            continue
+        record = _normalize_group_chat_activity_record(raw_record)
+        recipient_map[int(safe_chat_id)] = {
+            "chat_id": int(safe_chat_id),
+            "chat_type": record.get("chat_type", "") or "group",
+            "title": str(record.get("title", "")).strip(),
+        }
+
+    if reports_chat_id is not None and int(reports_chat_id) < 0:
+        recipient_map[int(reports_chat_id)] = recipient_map.get(
+            int(reports_chat_id),
+            {
+                "chat_id": int(reports_chat_id),
+                "chat_type": "group",
+                "title": "",
+            },
+        )
+
+    recipients = list(recipient_map.values())
+    recipients.sort(key=lambda item: int(item.get("chat_id", 0)))
+    return recipients
+
+
+def _build_auto_release_private_text(language):
+    safe_language = _normalize_broadcast_language(language)
+    if safe_language == "uz":
+        return (
+            "🆕 <b>Strike.Uz bot yangilandi!</b>\n\n"
+            "Mini App va tugmalar avtomatik yangilandi.\n"
+            "Pastdagi tugma orqali miniappni oching."
+        )
+    return (
+        "🆕 <b>Бот Strike.Uz обновлён!</b>\n\n"
+        "Mini App и кнопки обновлены автоматически.\n"
+        "Откройте миниапп кнопкой ниже."
+    )
+
+
+def _build_auto_release_group_text():
+    return (
+        "🆕 <b>Strike.Uz bot yangilandi / обновлён</b>\n\n"
+        "Klaviatura yangilandi: <code>/players</code>, <code>/server</code>, <code>/miniapp</code>\n"
+        "Клавиатура обновлена: <code>/players</code>, <code>/server</code>, <code>/miniapp</code>\n"
+        "Mini App'ni <b>/miniapp</b> buyrug'i orqali oching."
+    )
+
+
+def _build_auto_release_private_markup():
+    web_url = get_web_app_url()
+    if web_url:
+        try:
+            return InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📱 Open Mini App", web_app=WebAppInfo(url=web_url))]]
+            ).to_dict()
+        except Exception:
+            pass
+
+    fallback_url = _build_group_miniapp_deeplink() or web_url
+    if fallback_url:
+        return InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📱 Open Mini App", url=fallback_url)]]
+        ).to_dict()
+    return None
+
+
+def _run_auto_release_broadcast_worker():
+    if not AUTO_RELEASE_BROADCAST_ENABLED:
+        print("[AUTO RELEASE] Disabled by AUTO_RELEASE_BROADCAST_ENABLED", file=sys.stderr)
+        return
+    if not TOKEN:
+        print("[AUTO RELEASE] BOT_TOKEN is not set", file=sys.stderr)
+        return
+
+    release_key = _build_auto_release_broadcast_key()
+    if not release_key:
+        print("[AUTO RELEASE] Skipped: empty release key", file=sys.stderr)
+        return
+
+    current_state = _get_release_broadcast_state_snapshot()
+    if str(current_state.get("last_release_key", "")).strip() == release_key:
+        print(f"[AUTO RELEASE] Skipped: already sent for key={release_key}", file=sys.stderr)
+        return
+
+    private_recipients = _get_auto_release_private_recipients()
+    group_recipients = _get_auto_release_group_recipients()
+    total_private = len(private_recipients)
+    total_groups = len(group_recipients)
+    if total_private <= 0 and total_groups <= 0:
+        print("[AUTO RELEASE] Skipped: no recipients", file=sys.stderr)
+        return
+
+    print(
+        (
+            f"[AUTO RELEASE] Start key={release_key} "
+            f"private={total_private} groups={total_groups}"
+        ),
+        file=sys.stderr,
+    )
+
+    private_markup = _build_auto_release_private_markup()
+    group_markup = build_group_keyboard().to_dict()
+    group_text = _build_auto_release_group_text()
+    delay_seconds = max(1.0 / float(BROADCAST_MESSAGES_PER_SECOND), 0.06)
+
+    private_sent = 0
+    private_failed = 0
+    for recipient in private_recipients:
+        chat_id = int(_safe_int(recipient.get("chat_id", 0), 0))
+        if chat_id <= 0:
+            continue
+        text = _build_auto_release_private_text(recipient.get("language", "ru"))
+        try:
+            result = telegram_send_message(chat_id, text, reply_markup=private_markup)
+            if bool(result.get("ok")):
+                private_sent += 1
+            else:
+                private_failed += 1
+        except Exception as error:
+            private_failed += 1
+            print(
+                f"[AUTO RELEASE] Private send failed user_id={chat_id}: {_redact_sensitive_text(error)}",
+                file=sys.stderr,
+            )
+        time.sleep(delay_seconds)
+
+    group_sent = 0
+    group_failed = 0
+    for recipient in group_recipients:
+        chat_id = int(_safe_int(recipient.get("chat_id", 0), 0))
+        if chat_id >= 0:
+            continue
+        try:
+            result = telegram_send_message(chat_id, group_text, reply_markup=group_markup)
+            if bool(result.get("ok")):
+                group_sent += 1
+            else:
+                group_failed += 1
+        except Exception as error:
+            group_failed += 1
+            print(
+                f"[AUTO RELEASE] Group send failed chat_id={chat_id}: {_redact_sensitive_text(error)}",
+                file=sys.stderr,
+            )
+        time.sleep(delay_seconds)
+
+    _save_release_broadcast_state(
+        {
+            "last_release_key": release_key,
+            "last_sent_at": int(time.time()),
+            "private_sent": int(private_sent),
+            "private_failed": int(private_failed),
+            "group_sent": int(group_sent),
+            "group_failed": int(group_failed),
+        }
+    )
+
+    print(
+        (
+            f"[AUTO RELEASE] Done key={release_key} "
+            f"private={private_sent}/{total_private} "
+            f"groups={group_sent}/{total_groups}"
+        ),
+        file=sys.stderr,
+    )
+
+
+def start_auto_release_broadcast():
+    global AUTO_RELEASE_BROADCAST_STARTED
+    with BROADCAST_RUNTIME_LOCK:
+        if AUTO_RELEASE_BROADCAST_STARTED:
+            return
+        AUTO_RELEASE_BROADCAST_STARTED = True
+
+    thread = threading.Thread(
+        target=_run_auto_release_broadcast_worker,
+        daemon=True,
+        name="auto-release-broadcast",
+    )
+    thread.start()
+
+
 def _build_release_news_message(video_url):
     safe_video_url = str(video_url or "").strip()
     escaped_video_url = html.escape(safe_video_url, quote=True)
@@ -5752,21 +6201,20 @@ def build_group_keyboard():
 
 async def configure_chat_menu_button(application):
     _url = get_web_app_url()
-    if not _url:
-        return
-
-    try:
-        await application.bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(
-                text="Mini App",
-                web_app=WebAppInfo(url=_url),
+    if _url:
+        try:
+            await application.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="Mini App",
+                    web_app=WebAppInfo(url=_url),
+                )
             )
-        )
-    except Exception as e:
-        print(
-            f"[BOT WARNING] Failed to set chat menu button: {_redact_sensitive_text(e)}",
-            file=sys.stderr,
-        )
+        except Exception as e:
+            print(
+                f"[BOT WARNING] Failed to set chat menu button: {_redact_sensitive_text(e)}",
+                file=sys.stderr,
+            )
+    start_auto_release_broadcast()
 
 
 async def ensure_chat_menu_button_for_chat(bot, chat_id):
@@ -7551,6 +7999,13 @@ async def group_reports_autobind(update: Update, context: ContextTypes.DEFAULT_T
     if not chat or chat.type not in {"group", "supergroup"}:
         return
 
+    touch_group_chat_activity(
+        chat.id,
+        chat_title=chat.title or "",
+        chat_type=chat.type,
+        source="group_reports_autobind",
+    )
+
     if get_reports_chat_id() is None:
         bind_reports_chat(chat.id, chat.title or "")
         print(f"[REPORTS] Auto-bound reports chat: {chat.id} ({chat.title})")
@@ -7565,6 +8020,13 @@ async def bind_reports_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if chat.type not in {"group", "supergroup"}:
         await message.reply_text("Команду /bind_reports нужно запускать внутри группы отчётов.")
         return
+
+    touch_group_chat_activity(
+        chat.id,
+        chat_title=chat.title or "",
+        chat_type=chat.type,
+        source="bind_reports_command",
+    )
 
     if not bind_reports_chat(chat.id, chat.title or ""):
         await message.reply_text("Не удалось привязать группу отчётов.")
