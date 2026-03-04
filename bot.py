@@ -10250,7 +10250,9 @@ def build_application():
     application.add_handler(CommandHandler("release_news", release_news_command))
     application.add_handler(CommandHandler("bind_reports", bind_reports_command))
 
-    application.add_handler(MessageHandler(filters.ChatType.GROUPS, group_reports_autobind))
+    application.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND, group_reports_autobind)
+    )
 
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex("^👥 Players$"), players_button)
