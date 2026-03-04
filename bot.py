@@ -27,6 +27,7 @@ from telegram.ext import MessageHandler, filters
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -5742,8 +5743,8 @@ def build_main_keyboard():
 def build_group_keyboard():
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton("👥 Players"), KeyboardButton("🌐 Servers")],
-            [KeyboardButton("📱 App")],
+            [KeyboardButton("/players"), KeyboardButton("/server")],
+            [KeyboardButton("/miniapp")],
         ],
         resize_keyboard=True,
     )
@@ -6179,6 +6180,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_keyboard()
         )
     else:
+        try:
+            await update.message.reply_text(
+                "🧹 Обновляю клавиатуру...",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+        except Exception:
+            pass
         await update.message.reply_text(
             "👋 Strike.Uz bot\n\n"
             "Нажмите кнопки ниже или используйте команды:\n"
