@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState, type ChangeEvent } from "react";
 import { Check, Copy, Loader2, Upload, WalletCards, X } from "lucide-react";
-import { submitBalanceTopUp, type BalanceTopUpResponse } from "../api/strikeApi";
+import {
+  startBalanceTopUpSession,
+  submitBalanceTopUp,
+  type BalanceTopUpResponse,
+} from "../api/strikeApi";
 import {
   clearPersistedTopUpFlow,
   isTopUpUploadSessionActive,
@@ -21,8 +25,10 @@ interface BalanceTopUpModalProps {
 type ModalStep = 1 | 2 | 3;
 
 const TOPUP_SESSION_SECONDS = 5 * 60;
-const PAYMENT_CARD_NUMBER = "9860 1001 2447 4881";
-const PAYMENT_RECIPIENT = "Fayzixanov M.";
+const PAYMENT_CARD_NUMBER_RAW = "5614 6822 1666 1316";
+const PAYMENT_RECIPIENT = "Murod Fayzixanov";
+const PAYMENT_CARD_BRAND = "UzCard";
+const PAYMENT_CARD_BANK = "Kapitalbank";
 
 function formatCountdown(seconds: number): string {
   const safe = Math.max(Math.floor(seconds), 0);
@@ -97,6 +103,7 @@ export function BalanceTopUpModal({
   const [errorText, setErrorText] = useState<string | null>(null);
   const [copyHint, setCopyHint] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isStartingSession, setIsStartingSession] = useState(false);
 
   const t = useMemo(
     () => ({
@@ -116,6 +123,7 @@ export function BalanceTopUpModal({
       copy: isUz ? "Nusxalash" : "Скопировать",
       copied: isUz ? "Karta raqami nusxalandi" : "Номер карты успешно скопирован",
       toUploadStep: isUz ? "Skrinshot yuborishga o'tish" : "Перейти к отправке скриншота",
+      preparingSession: isUz ? "Tekshiruv tayyorlanmoqda..." : "Подготавливаем проверку...",
       uploadTitle: isUz ? "To'lov skrinshotini yuboring" : "Отправьте скриншот оплаты",
       uploadHint: isUz
         ? "Yuqoridagi karta raqamiga to'ldirmoqchi bo'lgan summani o'tkazing va to'lov tasdiq skrinshotini yuboring."
@@ -136,6 +144,9 @@ export function BalanceTopUpModal({
       sendFailed: isUz
         ? "Popolnenie yuborilmadi. Qayta urinib ko'ring."
         : "Не удалось отправить пополнение. Попробуйте снова.",
+      sessionInitFailed: isUz
+        ? "Tekshiruv sessiyasini tayyorlab bo'lmadi. Qayta urinib ko'ring."
+        : "Не удалось подготовить сессию проверки. Попробуйте снова.",
       step1Title: isUz ? "Qanday ishlaydi?" : "Как это работает?",
       step1Text1: isUz
         ? "1) Karta ma'lumotlarini olasiz va to'lov qilasiz."
@@ -174,6 +185,7 @@ export function BalanceTopUpModal({
     setErrorText(null);
     setCopyHint(null);
     setIsSubmitting(false);
+    setIsStartingSession(false);
   };
 
   useEffect(() => {
@@ -192,6 +204,7 @@ export function BalanceTopUpModal({
       setErrorText(null);
       setCopyHint(null);
       setIsSubmitting(false);
+      setIsStartingSession(false);
       return;
     }
 
@@ -274,7 +287,7 @@ export function BalanceTopUpModal({
   }
 
   const handleClose = () => {
-    if (isSessionLocked) {
+    if (isSessionLocked || isStartingSession) {
       return;
     }
     clearPersistedTopUpFlow();
@@ -284,7 +297,7 @@ export function BalanceTopUpModal({
 
   const handleCopyCard = async () => {
     try {
-      await navigator.clipboard.writeText(PAYMENT_CARD_NUMBER.replace(/\s+/g, ""));
+      await navigator.clipboard.writeText(PAYMENT_CARD_NUMBER_RAW.replace(/\s+/g, ""));
       setCopyHint(t.copied);
     } catch {
       setCopyHint(t.copied);
@@ -298,7 +311,7 @@ export function BalanceTopUpModal({
   };
 
   const handleBackToIntro = () => {
-    if (isSubmitting) {
+    if (isSubmitting || isStartingSession) {
       return;
     }
     setErrorText(null);
@@ -306,7 +319,7 @@ export function BalanceTopUpModal({
     persistFlowState(1, null);
   };
 
-  const handleStartUploadStep = () => {
+  const handleStartUploadStep = async () => {
     if (userId <= 0) {
       return;
     }
@@ -316,12 +329,46 @@ export function BalanceTopUpModal({
       startedAt,
       expiresAt: startedAt + TOPUP_SESSION_SECONDS,
     };
-    setStep(3);
-    setSession(nextSession);
-    setSecondsLeft(TOPUP_SESSION_SECONDS);
-    setScreenshot(null);
+    const telegramUser = (
+      window as Window & {
+        Telegram?: {
+          WebApp?: {
+            initDataUnsafe?: {
+              user?: {
+                username?: string;
+                first_name?: string;
+                last_name?: string;
+              };
+            };
+          };
+        };
+      }
+    ).Telegram?.WebApp?.initDataUnsafe?.user;
+
+    setIsStartingSession(true);
     setErrorText(null);
-    persistFlowState(3, nextSession);
+    try {
+      await startBalanceTopUpSession({
+        userId,
+        username: telegramUser?.username ?? "",
+        firstName: telegramUser?.first_name ?? "",
+        lastName: telegramUser?.last_name ?? "",
+        topupSessionId: nextSession.sessionId,
+        topupSessionStartedAt: nextSession.startedAt,
+        topupSessionExpiresAt: nextSession.expiresAt,
+        language,
+      });
+      setStep(3);
+      setSession(nextSession);
+      setSecondsLeft(TOPUP_SESSION_SECONDS);
+      setScreenshot(null);
+      setErrorText(null);
+      persistFlowState(3, nextSession);
+    } catch (error) {
+      setErrorText(extractReadableError(error) || t.sessionInitFailed);
+    } finally {
+      setIsStartingSession(false);
+    }
   };
 
   const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -339,10 +386,15 @@ export function BalanceTopUpModal({
     setScreenshot(null);
     setErrorText(null);
     setIsSubmitting(false);
+    setIsStartingSession(false);
     persistFlowState(1, null);
   };
 
   const handleSubmit = async () => {
+    if (isStartingSession) {
+      setErrorText(t.preparingSession);
+      return;
+    }
     if (!session || secondsLeft <= 0) {
       setErrorText(t.sessionExpired);
       return;
@@ -410,9 +462,9 @@ export function BalanceTopUpModal({
           <button
             type="button"
             onClick={handleClose}
-            disabled={isSessionLocked}
+            disabled={isSessionLocked || isStartingSession}
             className={`w-9 h-9 rounded-lg border flex items-center justify-center transition-colors ${
-              isSessionLocked
+              isSessionLocked || isStartingSession
                 ? "bg-[#1b1b1b] border-[#2a2a2a] text-[#555555] cursor-not-allowed"
                 : "bg-[#1f1f1f] border-[#2a2a2a] text-[#888888] hover:text-[#FCFCFC]"
             }`}
@@ -459,9 +511,8 @@ export function BalanceTopUpModal({
             <p className="text-[#FCFCFC] text-sm leading-relaxed font-semibold">{t.copyCardTitle}</p>
             <p className="text-[#888888] text-xs leading-relaxed">{t.copyCardHint}</p>
             <div className="bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg p-4">
-              <p className="text-[#888888] text-xs mb-2">{t.recipient}: {PAYMENT_RECIPIENT}</p>
               <p className="text-[#FCFCFC] text-[clamp(1.45rem,6.2vw,1.85rem)] font-black tracking-[0.04em] leading-tight whitespace-nowrap text-center overflow-x-auto">
-                {PAYMENT_CARD_NUMBER}
+                {PAYMENT_CARD_NUMBER_RAW}
               </p>
               <div className="mt-3 flex justify-center">
                 <button
@@ -473,6 +524,12 @@ export function BalanceTopUpModal({
                   {t.copy}
                 </button>
               </div>
+              <div className="mt-3 text-center">
+                <p className="text-[#a4a4ad] text-[11px] uppercase tracking-[0.1em]">
+                  {PAYMENT_CARD_BRAND} - {PAYMENT_CARD_BANK}
+                </p>
+                <p className="text-[#888888] text-xs mt-1">{t.recipient}: {PAYMENT_RECIPIENT}</p>
+              </div>
             </div>
           </div>
         )}
@@ -483,19 +540,24 @@ export function BalanceTopUpModal({
               <h4 className="text-[#FCFCFC] text-base font-bold">{t.uploadTitle}</h4>
               <p className="text-[#888888] text-xs mt-1.5 leading-relaxed">{t.uploadHint}</p>
 
-              <div className="mt-3 bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2.5 flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="text-[#888888] text-[11px] uppercase tracking-wide">{t.recipient}: {PAYMENT_RECIPIENT}</p>
-                  <p className="text-[#FCFCFC] text-sm font-bold truncate mt-0.5">{PAYMENT_CARD_NUMBER}</p>
+              <div className="mt-3 bg-[#0f0f0f] border border-[#2a2a2a] rounded-lg px-3 py-2.5">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[#FCFCFC] text-sm font-bold truncate">{PAYMENT_CARD_NUMBER_RAW}</p>
+                    <p className="text-[#a4a4ad] text-[10px] uppercase tracking-[0.1em] mt-0.5">
+                      {PAYMENT_CARD_BRAND} - {PAYMENT_CARD_BANK}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleCopyCard}
+                    className="shrink-0 inline-flex items-center gap-1.5 bg-[#1a1a1a] border border-[#F08800]/55 rounded-lg px-2.5 py-2 text-[#FCFCFC] text-[11px] font-bold uppercase"
+                  >
+                    <Copy className="w-3.5 h-3.5 text-[#F08800]" strokeWidth={2.2} />
+                    {t.copy}
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleCopyCard}
-                  className="shrink-0 inline-flex items-center gap-1.5 bg-[#1a1a1a] border border-[#F08800]/55 rounded-lg px-2.5 py-2 text-[#FCFCFC] text-[11px] font-bold uppercase"
-                >
-                  <Copy className="w-3.5 h-3.5 text-[#F08800]" strokeWidth={2.2} />
-                  {t.copy}
-                </button>
+                <p className="text-[#888888] text-[11px] mt-2 text-right">{t.recipient}: {PAYMENT_RECIPIENT}</p>
               </div>
 
               <div className="mt-3 bg-[#1a1a1a] border border-[#F08800]/45 rounded-lg px-3 py-2.5 inline-flex items-center gap-2">
@@ -508,17 +570,17 @@ export function BalanceTopUpModal({
 
             <label
               htmlFor="balance-topup-upload"
-              className="block bg-[#1a1a1a] border border-dashed border-[#3a3a3a] hover:border-[#F08800]/60 rounded-lg p-4 cursor-pointer transition-all"
+              className="block bg-gradient-to-br from-[#2a1a06] to-[#1e1305] border border-dashed border-[#ffb84a]/70 hover:border-[#ffd27a] rounded-lg p-4 cursor-pointer transition-all shadow-[0_0_0_1px_rgba(255,176,62,0.2),0_10px_28px_rgba(255,149,0,0.18)]"
             >
               <div className="flex items-center gap-3">
-                <div className="w-10 h-10 bg-[#F08800]/10 rounded-lg flex items-center justify-center">
-                  <Upload className="w-5 h-5 text-[#F08800]" strokeWidth={2.2} />
+                <div className="w-10 h-10 bg-gradient-to-br from-[#FFB100]/30 to-[#FF8A00]/25 border border-[#ffca6d]/70 rounded-lg flex items-center justify-center shadow-[0_6px_14px_rgba(255,164,0,0.25)]">
+                  <Upload className="w-5 h-5 text-[#ffd27a]" strokeWidth={2.2} />
                 </div>
                 <div className="min-w-0">
                   <p className="text-[#FCFCFC] text-sm font-bold truncate">
                     {screenshot ? screenshot.name : t.chooseFile}
                   </p>
-                  <p className="text-[#888888] text-xs mt-1">{t.fileHint}</p>
+                  <p className="text-[#ffcf83] text-xs mt-1">{t.fileHint}</p>
                 </div>
               </div>
               <input
@@ -527,7 +589,7 @@ export function BalanceTopUpModal({
                 accept="image/png,image/jpeg,image/jpg,image/webp"
                 className="hidden"
                 onChange={handleFileChange}
-                disabled={isSubmitting || secondsLeft <= 0}
+                disabled={isSubmitting || isStartingSession || secondsLeft <= 0}
               />
             </label>
           </div>
@@ -575,10 +637,11 @@ export function BalanceTopUpModal({
           {step === 2 && (
             <button
               type="button"
-              onClick={handleStartUploadStep}
-              className="flex-[1.35] py-3.5 rounded-lg font-black uppercase tracking-wide text-[11px] bg-[#F08800] text-[#121212] hover:bg-[#d97700]"
+              onClick={() => void handleStartUploadStep()}
+              disabled={isSubmitting || isStartingSession}
+              className="flex-[1.35] py-3.5 rounded-lg font-black uppercase tracking-wide text-[11px] bg-gradient-to-r from-[#FFC533] via-[#FFB100] to-[#FF9700] text-[#111111] shadow-[0_10px_24px_rgba(255,165,0,0.45)] hover:brightness-105 ring-1 ring-[#ffd27a]/60"
             >
-              {t.toUploadStep}
+              {isStartingSession ? t.preparingSession : t.toUploadStep}
             </button>
           )}
 
@@ -596,10 +659,10 @@ export function BalanceTopUpModal({
             <button
               type="button"
               onClick={() => void handleSubmit()}
-              disabled={isSubmitting || userId <= 0}
+              disabled={isSubmitting || isStartingSession || userId <= 0}
               className={`w-full py-3.5 rounded-lg font-black uppercase tracking-wide text-sm transition-all ${
-                !isSubmitting && userId > 0
-                  ? "bg-[#F08800] text-[#121212] hover:bg-[#d97700]"
+                !isSubmitting && !isStartingSession && userId > 0
+                  ? "bg-gradient-to-r from-[#FFC533] via-[#FFB100] to-[#FF9700] text-[#111111] shadow-[0_12px_28px_rgba(255,165,0,0.5)] hover:brightness-105 ring-1 ring-[#ffd27a]/70"
                   : "bg-[#2a2a2a] text-[#555555] cursor-not-allowed"
               }`}
             >

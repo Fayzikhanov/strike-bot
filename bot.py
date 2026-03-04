@@ -11,11 +11,12 @@ import time
 import threading
 import uuid
 import hashlib
+import hmac
 import http.cookiejar
 import ftplib
 import ssl
 from decimal import Decimal, ROUND_DOWN
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -98,11 +99,38 @@ A2S_TIMEOUT = 3.0
 A2S_COOLDOWN_SECONDS = float(os.getenv("A2S_COOLDOWN_SECONDS", "60").strip() or "60")
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("API_PORT", "8090"))
+ADMIN_DASHBOARD_KEY = os.getenv("ADMIN_DASHBOARD_KEY", "").strip()
+WELCOME_BONUS_AMOUNT = max(_env_int("WELCOME_BONUS_AMOUNT", 10000), 0)
+ADMIN_DEFAULT_PAGE_SIZE = max(_env_int("ADMIN_DEFAULT_PAGE_SIZE", 30), 1)
+ADMIN_MAX_PAGE_SIZE = max(_env_int("ADMIN_MAX_PAGE_SIZE", 100), ADMIN_DEFAULT_PAGE_SIZE)
+USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS = max(_env_int("USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS", 45), 0)
+USER_ACTIVE_WINDOW_SECONDS = max(_env_int("USER_ACTIVE_WINDOW_SECONDS", 86400), 60)
 REPORTS_TIMEZONE = ZoneInfo("Asia/Tashkent")
 REPORTS_SCHEDULER_CHECK_SECONDS = 20
 REPORTS_STORAGE_DIR = os.path.join(os.path.dirname(__file__), "data")
 REPORTS_STORAGE_PATH = os.path.join(REPORTS_STORAGE_DIR, "purchase_reports.json")
 REPORTS_CHAT_ID_ENV = os.getenv("REPORTS_CHAT_ID", "").strip()
+BROADCAST_MESSAGES_PER_SECOND = max(
+    float(os.getenv("BROADCAST_MESSAGES_PER_SECOND", "18").strip() or "18"),
+    1.0,
+)
+BROADCAST_PREVIEW_TTL_SECONDS = max(
+    _env_int("BROADCAST_PREVIEW_TTL_SECONDS", 900),
+    60,
+)
+BROADCAST_QUEUE_IDLE_SECONDS = max(
+    float(os.getenv("BROADCAST_QUEUE_IDLE_SECONDS", "0.25").strip() or "0.25"),
+    0.05,
+)
+BROADCAST_CAMPAIGN_MAX_KEEP = max(
+    _env_int("BROADCAST_CAMPAIGN_MAX_KEEP", 200),
+    20,
+)
+BROADCAST_CAMPAIGN_LOG_LIMIT = max(
+    _env_int("BROADCAST_CAMPAIGN_LOG_LIMIT", 50000),
+    1000,
+)
+BROADCAST_SEND_CONFIRM_PHRASE = "SEND"
 MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
 PAYMENT_MAX_SCREENSHOT_ATTEMPTS = max(
     _env_int("PAYMENT_MAX_SCREENSHOT_ATTEMPTS", 3),
@@ -124,6 +152,7 @@ PAYMENT_UPLOAD_SESSION_SECONDS = max(
     _env_int("PAYMENT_UPLOAD_SESSION_SECONDS", 300),
     60,
 )
+PAYMENT_SUPPORT_CONTACT = os.getenv("PAYMENT_SUPPORT_CONTACT", "@MCCALLSTRIKE").strip() or "@MCCALLSTRIKE"
 
 SERVERS = {
     "public": {
@@ -296,8 +325,11 @@ def _build_default_reports_store():
         "purchases": [],
         "balances": {},
         "balance_transactions": [],
+        "welcome_bonus_claims": {},
+        "user_activity": {},
         "payment_attempts": {},
         "payment_user_violations": {},
+        "broadcast_campaigns": [],
         "last_reports": {
             "daily": "",
             "weekly": "",
@@ -342,6 +374,14 @@ def _load_reports_store():
     if isinstance(balance_transactions, list):
         store["balance_transactions"] = balance_transactions
 
+    welcome_bonus_claims = loaded.get("welcome_bonus_claims", {})
+    if isinstance(welcome_bonus_claims, dict):
+        store["welcome_bonus_claims"] = welcome_bonus_claims
+
+    user_activity = loaded.get("user_activity", {})
+    if isinstance(user_activity, dict):
+        store["user_activity"] = user_activity
+
     payment_attempts = loaded.get("payment_attempts", {})
     if isinstance(payment_attempts, dict):
         store["payment_attempts"] = payment_attempts
@@ -349,6 +389,10 @@ def _load_reports_store():
     payment_user_violations = loaded.get("payment_user_violations", {})
     if isinstance(payment_user_violations, dict):
         store["payment_user_violations"] = payment_user_violations
+
+    broadcast_campaigns = loaded.get("broadcast_campaigns", [])
+    if isinstance(broadcast_campaigns, list):
+        store["broadcast_campaigns"] = broadcast_campaigns
 
     last_reports = loaded.get("last_reports", {})
     if isinstance(last_reports, dict):
@@ -372,6 +416,10 @@ A2S_STATE_LOCK = threading.Lock()
 A2S_DISABLED_UNTIL = 0.0
 FTP_PATH_CACHE_LOCK = threading.Lock()
 PAYMENT_VERIFIER = PaymentVerificationService()
+BROADCAST_RUNTIME_LOCK = threading.Lock()
+BROADCAST_QUEUE = deque()
+BROADCAST_PREVIEWS = {}
+BROADCAST_WORKER_STARTED = False
 
 
 def _save_reports_store_locked():
@@ -605,6 +653,1988 @@ def get_cashback_totals(*, start_ts=0, end_ts=0):
     return int(total_cashback)
 
 
+def _normalize_welcome_bonus_claim(raw_value):
+    if not isinstance(raw_value, dict):
+        return {
+            "claimed_at": 0,
+            "amount": 0,
+            "balance_before": 0,
+            "balance_after": 0,
+            "tx_id": "",
+            "request_id": "",
+            "username": "",
+            "first_name": "",
+            "last_name": "",
+        }
+
+    return {
+        "claimed_at": max(_safe_int(raw_value.get("claimed_at", 0), 0), 0),
+        "amount": max(_safe_int(raw_value.get("amount", 0), 0), 0),
+        "balance_before": max(_safe_int(raw_value.get("balance_before", 0), 0), 0),
+        "balance_after": max(_safe_int(raw_value.get("balance_after", 0), 0), 0),
+        "tx_id": str(raw_value.get("tx_id", "")).strip(),
+        "request_id": str(raw_value.get("request_id", "")).strip(),
+        "username": str(raw_value.get("username", "")).strip().lstrip("@"),
+        "first_name": str(raw_value.get("first_name", "")).strip(),
+        "last_name": str(raw_value.get("last_name", "")).strip(),
+    }
+
+
+def get_welcome_bonus_claim_snapshot(user_id):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        return _normalize_welcome_bonus_claim({})
+
+    key = str(safe_user_id)
+    with REPORTS_LOCK:
+        claims = REPORTS_STORE.setdefault("welcome_bonus_claims", {})
+        if not isinstance(claims, dict):
+            claims = {}
+            REPORTS_STORE["welcome_bonus_claims"] = claims
+
+        normalized = _normalize_welcome_bonus_claim(claims.get(key))
+        claims[key] = dict(normalized)
+
+    return dict(normalized)
+
+
+def claim_welcome_bonus_once(
+    user_id,
+    *,
+    amount=WELCOME_BONUS_AMOUNT,
+    username="",
+    first_name="",
+    last_name="",
+    request_id="",
+):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        raise ValueError("Invalid user id")
+
+    claim_amount = max(_safe_int(amount, 0), 0)
+    if claim_amount <= 0:
+        raise ValueError("Welcome bonus amount must be positive")
+
+    safe_username = str(username or "").strip().lstrip("@")
+    safe_first_name = str(first_name or "").strip()
+    safe_last_name = str(last_name or "").strip()
+    safe_request_id = str(request_id or "").strip()
+    now_ts = int(time.time())
+    key = str(safe_user_id)
+
+    with REPORTS_LOCK:
+        claims = REPORTS_STORE.setdefault("welcome_bonus_claims", {})
+        if not isinstance(claims, dict):
+            claims = {}
+            REPORTS_STORE["welcome_bonus_claims"] = claims
+
+        balances = REPORTS_STORE.setdefault("balances", {})
+        if not isinstance(balances, dict):
+            balances = {}
+            REPORTS_STORE["balances"] = balances
+
+        transactions = REPORTS_STORE.setdefault("balance_transactions", [])
+        if not isinstance(transactions, list):
+            transactions = []
+            REPORTS_STORE["balance_transactions"] = transactions
+
+        existing_claim = _normalize_welcome_bonus_claim(claims.get(key))
+        current_record = _normalize_balance_record(balances.get(key))
+        current_balance = int(current_record.get("balance", 0) or 0)
+
+        if existing_claim.get("claimed_at", 0) > 0:
+            # Idempotency: bonus was already claimed before.
+            claims[key] = dict(existing_claim)
+            return {
+                "claimed_now": False,
+                "already_claimed": True,
+                "claim": dict(existing_claim),
+                "balance_before": current_balance,
+                "balance_after": current_balance,
+            }
+
+        balance_before = current_balance
+        balance_after = balance_before + claim_amount
+        next_record = {
+            "balance": int(balance_after),
+            "updated_at": now_ts,
+        }
+        balances[key] = next_record
+
+        tx_id = uuid.uuid4().hex[:14]
+        transactions.append(
+            {
+                "id": tx_id,
+                "created_at": now_ts,
+                "user_id": int(safe_user_id),
+                "type": "welcome_bonus",
+                "delta": int(claim_amount),
+                "before": int(balance_before),
+                "after": int(balance_after),
+                "meta": {
+                    "source": "welcome_bonus",
+                    "bonus_type": "welcome_bonus",
+                    "campaign": "starter_bonus",
+                    "welcome_bonus_amount": int(claim_amount),
+                },
+            }
+        )
+        if len(transactions) > 5000:
+            del transactions[: len(transactions) - 5000]
+
+        claim_record = {
+            "claimed_at": int(now_ts),
+            "amount": int(claim_amount),
+            "balance_before": int(balance_before),
+            "balance_after": int(balance_after),
+            "tx_id": str(tx_id),
+            "request_id": safe_request_id,
+            "username": safe_username,
+            "first_name": safe_first_name,
+            "last_name": safe_last_name,
+        }
+        claims[key] = dict(claim_record)
+        _save_reports_store_locked()
+
+    return {
+        "claimed_now": True,
+        "already_claimed": False,
+        "claim": dict(claim_record),
+        "balance_before": int(balance_before),
+        "balance_after": int(balance_after),
+    }
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _normalize_user_activity_record(raw_value):
+    if not isinstance(raw_value, dict):
+        return {
+            "last_activity_at": 0,
+            "username": "",
+            "first_name": "",
+            "last_name": "",
+            "source": "",
+            "language": "",
+        }
+    safe_language = _normalize_broadcast_language(raw_value.get("language", ""))
+    if safe_language not in {"ru", "uz"}:
+        safe_language = ""
+    return {
+        "last_activity_at": max(_safe_int(raw_value.get("last_activity_at", 0), 0), 0),
+        "username": str(raw_value.get("username", "")).strip().lstrip("@"),
+        "first_name": str(raw_value.get("first_name", "")).strip(),
+        "last_name": str(raw_value.get("last_name", "")).strip(),
+        "source": str(raw_value.get("source", "")).strip(),
+        "language": safe_language,
+    }
+
+
+def touch_user_activity(
+    user_id,
+    *,
+    username="",
+    first_name="",
+    last_name="",
+    source="",
+    language="",
+    timestamp=0,
+):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        return None
+
+    safe_username = str(username or "").strip().lstrip("@")
+    safe_first_name = str(first_name or "").strip()
+    safe_last_name = str(last_name or "").strip()
+    safe_source = str(source or "").strip()
+    safe_language = _normalize_broadcast_language(language) if str(language or "").strip() else ""
+    now_ts = max(_safe_int(timestamp, 0), int(time.time()))
+    activity_key = str(safe_user_id)
+
+    with REPORTS_LOCK:
+        activities = REPORTS_STORE.setdefault("user_activity", {})
+        if not isinstance(activities, dict):
+            activities = {}
+            REPORTS_STORE["user_activity"] = activities
+
+        current = _normalize_user_activity_record(activities.get(activity_key))
+        updated = dict(current)
+        should_save = False
+
+        if (
+            current.get("last_activity_at", 0) <= 0
+            or now_ts - int(current.get("last_activity_at", 0)) >= USER_ACTIVITY_TOUCH_MIN_INTERVAL_SECONDS
+        ):
+            updated["last_activity_at"] = now_ts
+            should_save = True
+
+        if safe_username and safe_username != current.get("username", ""):
+            updated["username"] = safe_username
+            should_save = True
+
+        if safe_first_name and safe_first_name != current.get("first_name", ""):
+            updated["first_name"] = safe_first_name
+            should_save = True
+
+        if safe_last_name and safe_last_name != current.get("last_name", ""):
+            updated["last_name"] = safe_last_name
+            should_save = True
+
+        if safe_source and safe_source != current.get("source", ""):
+            updated["source"] = safe_source
+            should_save = True
+        if safe_language and safe_language != current.get("language", ""):
+            updated["language"] = safe_language
+            should_save = True
+
+        if should_save:
+            activities[activity_key] = updated
+            _save_reports_store_locked()
+        return dict(updated)
+
+
+def touch_user_activity_from_update(update, *, source=""):
+    user = update.effective_user if update else None
+    if not user:
+        return None
+    raw_language_code = str(getattr(user, "language_code", "") or "").strip().lower()
+    language = ""
+    if raw_language_code.startswith("uz"):
+        language = "uz"
+    elif raw_language_code.startswith("ru"):
+        language = "ru"
+    return touch_user_activity(
+        user.id,
+        username=getattr(user, "username", "") or "",
+        first_name=getattr(user, "first_name", "") or "",
+        last_name=getattr(user, "last_name", "") or "",
+        source=source,
+        language=language,
+    )
+
+
+def _purchase_effective_amount(record):
+    if not isinstance(record, dict):
+        return 0
+    charged = _safe_int(record.get("issued_calculated_amount", 0), 0)
+    if charged > 0:
+        return int(charged)
+    amount = _safe_int(record.get("amount", 0), 0)
+    return int(max(amount, 0))
+
+
+def _build_active_privileges_map_for_users(purchases, now_local):
+    grouped = {}
+    seen_account_keys = set()
+    safe_purchases = [
+        item for item in purchases if isinstance(item, dict)
+    ]
+    safe_purchases.sort(key=lambda item: _safe_int(item.get("created_at", 0), 0), reverse=True)
+
+    for record in safe_purchases:
+        if str(record.get("status", "")).strip().lower() != "active":
+            continue
+        if not _is_active_privilege_product_type(record.get("product_type", PRODUCT_TYPE_PRIVILEGE)):
+            continue
+
+        user_id = _safe_int(record.get("user_id", 0), 0)
+        if user_id <= 0:
+            continue
+
+        created_at = _safe_int(record.get("created_at", 0), 0)
+        if created_at <= 0:
+            continue
+
+        identifier_type = normalize_privilege_identifier_type(
+            record.get("issued_identifier_type", record.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME))
+        )
+        nickname = str(record.get("nickname", "")).strip()
+        steam_id = normalize_steam_id(record.get("steam_id", ""))
+        identifier_value = steam_id if identifier_type == PRIVILEGE_IDENTIFIER_STEAM else nickname
+        if not identifier_value:
+            continue
+
+        server_id = _resolve_server_id_for_purchase_record(record)
+        account_key = "|".join(
+            [
+                str(user_id),
+                server_id or str(record.get("server", "")).strip(),
+                identifier_type,
+                identifier_value.casefold(),
+            ]
+        )
+        if account_key in seen_account_keys:
+            continue
+
+        lifecycle = _extract_privilege_lifecycle_from_record(record, now_local=now_local)
+        total_days = int(lifecycle.get("total_days", 0))
+        remaining_days = int(lifecycle.get("remaining_days", 0))
+        if remaining_days <= 0:
+            continue
+
+        issued_privilege = str(record.get("issued_privilege", "")).strip()
+        privilege_label = issued_privilege or str(record.get("privilege", "")).strip()
+        privilege_key = _normalize_sale_privilege_key(privilege_label)
+        if not privilege_key:
+            continue
+
+        grouped.setdefault(user_id, []).append(
+            {
+                "id": str(record.get("id", "")).strip(),
+                "createdAt": created_at,
+                "serverId": server_id,
+                "serverName": str(record.get("server", "")).strip(),
+                "privilegeKey": privilege_key,
+                "privilegeLabel": privilege_label,
+                "identifierType": identifier_type,
+                "nickname": nickname,
+                "steamId": steam_id,
+                "remainingDays": int(remaining_days),
+                "totalDays": int(total_days),
+                "isPermanent": bool(lifecycle.get("is_permanent")),
+            }
+        )
+        seen_account_keys.add(account_key)
+
+    return grouped
+
+
+def get_admin_dashboard_snapshot(*, page=1, page_size=30, search=""):
+    safe_page = max(_safe_int(page, 1), 1)
+    safe_page_size = max(_safe_int(page_size, ADMIN_DEFAULT_PAGE_SIZE), 1)
+    safe_page_size = min(safe_page_size, ADMIN_MAX_PAGE_SIZE)
+    safe_search = str(search or "").strip()
+    search_casefold = safe_search.casefold()
+
+    now_local = datetime.datetime.now(REPORTS_TIMEZONE)
+    now_ts = int(now_local.timestamp())
+    day_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = (now_local - datetime.timedelta(days=now_local.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    month_start = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    day_start_ts = int(day_start.timestamp())
+    week_start_ts = int(week_start.timestamp())
+    month_start_ts = int(month_start.timestamp())
+    active_since_ts = now_ts - USER_ACTIVE_WINDOW_SECONDS
+
+    with REPORTS_LOCK:
+        purchases = [
+            dict(item)
+            for item in REPORTS_STORE.setdefault("purchases", [])
+            if isinstance(item, dict)
+        ]
+        balances = dict(REPORTS_STORE.setdefault("balances", {})) if isinstance(REPORTS_STORE.get("balances"), dict) else {}
+        transactions = [
+            dict(item)
+            for item in REPORTS_STORE.setdefault("balance_transactions", [])
+            if isinstance(item, dict)
+        ]
+        welcome_bonus_claims = (
+            dict(REPORTS_STORE.setdefault("welcome_bonus_claims", {}))
+            if isinstance(REPORTS_STORE.get("welcome_bonus_claims"), dict)
+            else {}
+        )
+        user_activity = dict(REPORTS_STORE.setdefault("user_activity", {})) if isinstance(REPORTS_STORE.get("user_activity"), dict) else {}
+
+    active_privileges_map = _build_active_privileges_map_for_users(purchases, now_local)
+
+    purchase_metrics = {
+        "day": {"count": 0, "amount": 0},
+        "week": {"count": 0, "amount": 0},
+        "month": {"count": 0, "amount": 0},
+        "total": {"count": 0, "amount": 0},
+    }
+    privilege_metrics = {
+        "day": 0,
+        "week": 0,
+        "month": 0,
+        "total": 0,
+    }
+    topup_metrics = {
+        "day": {"count": 0, "amount": 0},
+        "week": {"count": 0, "amount": 0},
+        "month": {"count": 0, "amount": 0},
+        "total": {"count": 0, "amount": 0},
+    }
+    onboarding_metrics = {
+        "startedUsers": 0,
+        "welcomeBonusClaimedUsers": 0,
+        "welcomeBonusIssuedAmount": 0,
+        "welcomeBonusClaimRate": 0.0,
+    }
+
+    profiles = {}
+
+    def get_profile(user_id):
+        profile = profiles.get(user_id)
+        if profile is not None:
+            return profile
+        profile = {
+            "userId": int(user_id),
+            "username": "",
+            "firstName": "",
+            "lastName": "",
+            "balance": 0,
+            "ltv": 0,
+            "purchaseCount": 0,
+            "privilegePurchaseCount": 0,
+            "bonusPurchaseCount": 0,
+            "topupCount": 0,
+            "topupAmount": 0,
+            "cashbackAmount": 0,
+            "adminAdjustAmount": 0,
+            "lastActivityAt": 0,
+            "lastPurchaseAt": 0,
+            "lastTransactionAt": 0,
+            "recentPurchases": [],
+            "activePrivileges": [],
+            "importedPrivileges": [],
+        }
+        profiles[user_id] = profile
+        return profile
+
+    for user_id_raw, balance_raw in balances.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+        normalized_balance = _normalize_balance_record(balance_raw)
+        profile["balance"] = max(_safe_int(normalized_balance.get("balance", 0), 0), 0)
+        profile["lastActivityAt"] = max(
+            profile["lastActivityAt"],
+            _safe_int(normalized_balance.get("updated_at", 0), 0),
+        )
+
+    for record in purchases:
+        user_id = _safe_int(record.get("user_id", 0), 0)
+        if user_id <= 0:
+            continue
+
+        profile = get_profile(user_id)
+        username = str(record.get("username", "")).strip().lstrip("@")
+        if username and not profile["username"]:
+            profile["username"] = username
+        first_name = str(record.get("first_name", "")).strip()
+        if first_name and not profile["firstName"]:
+            profile["firstName"] = first_name
+        last_name = str(record.get("last_name", "")).strip()
+        if last_name and not profile["lastName"]:
+            profile["lastName"] = last_name
+
+        created_at = _safe_int(record.get("created_at", 0), 0)
+        profile["lastPurchaseAt"] = max(profile["lastPurchaseAt"], created_at)
+        profile["lastActivityAt"] = max(profile["lastActivityAt"], created_at)
+
+        if str(record.get("status", "")).strip().lower() != "active":
+            continue
+
+        amount = _purchase_effective_amount(record)
+        product_type = str(record.get("product_type", "privilege")).strip().lower()
+        is_sale_record = product_type in {PRODUCT_TYPE_PRIVILEGE, PRODUCT_TYPE_BONUS}
+        if is_sale_record:
+            purchase_metrics["total"]["count"] += 1
+            purchase_metrics["total"]["amount"] += amount
+            if created_at >= day_start_ts:
+                purchase_metrics["day"]["count"] += 1
+                purchase_metrics["day"]["amount"] += amount
+            if created_at >= week_start_ts:
+                purchase_metrics["week"]["count"] += 1
+                purchase_metrics["week"]["amount"] += amount
+            if created_at >= month_start_ts:
+                purchase_metrics["month"]["count"] += 1
+                purchase_metrics["month"]["amount"] += amount
+
+            profile["ltv"] += amount
+            profile["purchaseCount"] += 1
+
+            if product_type == PRODUCT_TYPE_PRIVILEGE:
+                privilege_metrics["total"] += 1
+                profile["privilegePurchaseCount"] += 1
+                if created_at >= day_start_ts:
+                    privilege_metrics["day"] += 1
+                if created_at >= week_start_ts:
+                    privilege_metrics["week"] += 1
+                if created_at >= month_start_ts:
+                    privilege_metrics["month"] += 1
+            elif product_type == PRODUCT_TYPE_BONUS:
+                profile["bonusPurchaseCount"] += 1
+
+        profile["recentPurchases"].append(
+            {
+                "id": str(record.get("id", "")).strip(),
+                "createdAt": created_at,
+                "productType": product_type,
+                "source": str(record.get("source", "")).strip().lower(),
+                "serverName": str(record.get("server", "")).strip(),
+                "privilege": str(record.get("issued_privilege", "")).strip() or str(record.get("privilege", "")).strip(),
+                "amount": amount,
+                "duration": str(record.get("duration", "")).strip(),
+                "nickname": str(record.get("nickname", "")).strip(),
+                "steamId": normalize_steam_id(record.get("steam_id", "")),
+                "identifierType": normalize_privilege_identifier_type(
+                    record.get("issued_identifier_type", record.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME))
+                ),
+            }
+        )
+        if product_type == PRODUCT_TYPE_LEGACY_IMPORT:
+            profile["importedPrivileges"].append(
+                {
+                    "id": str(record.get("id", "")).strip(),
+                    "createdAt": created_at,
+                    "serverName": str(record.get("server", "")).strip(),
+                    "privilege": str(record.get("issued_privilege", "")).strip()
+                    or str(record.get("privilege", "")).strip(),
+                    "identifierType": normalize_privilege_identifier_type(
+                        record.get("issued_identifier_type", record.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME))
+                    ),
+                    "nickname": str(record.get("nickname", "")).strip(),
+                    "steamId": normalize_steam_id(record.get("steam_id", "")),
+                    "isPermanent": bool(record.get("is_permanent")) or bool(record.get("imported_is_permanent")),
+                    "status": str(record.get("status", "")).strip().lower() or "active",
+                    "source": str(record.get("source", "")).strip().lower(),
+                }
+            )
+
+    for transaction in transactions:
+        user_id = _safe_int(transaction.get("user_id", 0), 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+        created_at = _safe_int(transaction.get("created_at", 0), 0)
+        tx_type = str(transaction.get("type", "")).strip().lower()
+        delta = _safe_int(transaction.get("delta", 0), 0)
+
+        profile["lastTransactionAt"] = max(profile["lastTransactionAt"], created_at)
+        profile["lastActivityAt"] = max(profile["lastActivityAt"], created_at)
+
+        if tx_type == "topup" and delta > 0:
+            profile["topupCount"] += 1
+            profile["topupAmount"] += delta
+            topup_metrics["total"]["count"] += 1
+            topup_metrics["total"]["amount"] += delta
+            if created_at >= day_start_ts:
+                topup_metrics["day"]["count"] += 1
+                topup_metrics["day"]["amount"] += delta
+            if created_at >= week_start_ts:
+                topup_metrics["week"]["count"] += 1
+                topup_metrics["week"]["amount"] += delta
+            if created_at >= month_start_ts:
+                topup_metrics["month"]["count"] += 1
+                topup_metrics["month"]["amount"] += delta
+        elif tx_type == "cashback" and delta > 0:
+            profile["cashbackAmount"] += delta
+        elif tx_type.startswith("admin_"):
+            profile["adminAdjustAmount"] += delta
+
+    for user_id_raw, activity_raw in user_activity.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        onboarding_metrics["startedUsers"] += 1
+        profile = get_profile(user_id)
+        activity = _normalize_user_activity_record(activity_raw)
+        profile["lastActivityAt"] = max(profile["lastActivityAt"], _safe_int(activity.get("last_activity_at", 0), 0))
+        if activity.get("username") and not profile["username"]:
+            profile["username"] = activity["username"]
+        if activity.get("first_name") and not profile["firstName"]:
+            profile["firstName"] = activity["first_name"]
+        if activity.get("last_name") and not profile["lastName"]:
+            profile["lastName"] = activity["last_name"]
+
+    for user_id_raw, claim_raw in welcome_bonus_claims.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        claim = _normalize_welcome_bonus_claim(claim_raw)
+        if _safe_int(claim.get("claimed_at", 0), 0) <= 0:
+            continue
+        onboarding_metrics["welcomeBonusClaimedUsers"] += 1
+        onboarding_metrics["welcomeBonusIssuedAmount"] += max(_safe_int(claim.get("amount", 0), 0), 0)
+
+    if onboarding_metrics["startedUsers"] > 0:
+        onboarding_metrics["welcomeBonusClaimRate"] = round(
+            (onboarding_metrics["welcomeBonusClaimedUsers"] / onboarding_metrics["startedUsers"]) * 100,
+            2,
+        )
+
+    for user_id, privilege_items in active_privileges_map.items():
+        profile = profiles.get(int(user_id))
+        if not profile:
+            continue
+        profile["activePrivileges"] = sorted(
+            privilege_items,
+            key=lambda item: int(item.get("createdAt", 0) or 0),
+            reverse=True,
+        )
+        profile["activePrivileges"] = profile["activePrivileges"][:10]
+
+    all_items = []
+    total_user_balance = 0
+    users_with_balance = 0
+    active_users_count = 0
+
+    for profile in profiles.values():
+        profile["recentPurchases"] = sorted(
+            profile["recentPurchases"],
+            key=lambda item: int(item.get("createdAt", 0) or 0),
+            reverse=True,
+        )[:6]
+        profile["importedPrivileges"] = sorted(
+            profile["importedPrivileges"],
+            key=lambda item: int(item.get("createdAt", 0) or 0),
+            reverse=True,
+        )[:20]
+        total_user_balance += int(max(profile.get("balance", 0), 0))
+        if int(profile.get("balance", 0)) > 0:
+            users_with_balance += 1
+        if int(profile.get("lastActivityAt", 0)) >= active_since_ts:
+            active_users_count += 1
+
+        display_name = f"{profile.get('firstName', '').strip()} {profile.get('lastName', '').strip()}".strip()
+        if not display_name:
+            display_name = profile.get("username", "").strip() or f"ID {profile.get('userId')}"
+
+        item = {
+            "userId": int(profile.get("userId", 0)),
+            "username": str(profile.get("username", "")).strip(),
+            "firstName": str(profile.get("firstName", "")).strip(),
+            "lastName": str(profile.get("lastName", "")).strip(),
+            "displayName": display_name,
+            "balance": int(max(profile.get("balance", 0), 0)),
+            "ltv": int(max(profile.get("ltv", 0), 0)),
+            "purchaseCount": int(max(profile.get("purchaseCount", 0), 0)),
+            "privilegePurchaseCount": int(max(profile.get("privilegePurchaseCount", 0), 0)),
+            "bonusPurchaseCount": int(max(profile.get("bonusPurchaseCount", 0), 0)),
+            "topupCount": int(max(profile.get("topupCount", 0), 0)),
+            "topupAmount": int(max(profile.get("topupAmount", 0), 0)),
+            "cashbackAmount": int(max(profile.get("cashbackAmount", 0), 0)),
+            "adminAdjustAmount": int(profile.get("adminAdjustAmount", 0) or 0),
+            "lastActivityAt": int(max(profile.get("lastActivityAt", 0), 0)),
+            "activePrivileges": list(profile.get("activePrivileges", [])),
+            "recentPurchases": list(profile.get("recentPurchases", [])),
+            "importedCount": int(len(profile.get("importedPrivileges", []))),
+            "importedPrivileges": list(profile.get("importedPrivileges", [])),
+        }
+        all_items.append(item)
+
+    if search_casefold:
+        filtered_items = []
+        for item in all_items:
+            if search_casefold in str(item.get("userId", "")).casefold():
+                filtered_items.append(item)
+                continue
+            username = str(item.get("username", "")).strip().casefold()
+            display_name = str(item.get("displayName", "")).strip().casefold()
+            if search_casefold in username or search_casefold in display_name:
+                filtered_items.append(item)
+                continue
+
+            matched_privilege = False
+            for privilege_item in item.get("activePrivileges", []):
+                server_name = str(privilege_item.get("serverName", "")).casefold()
+                privilege_name = str(privilege_item.get("privilegeLabel", "")).casefold()
+                if search_casefold in server_name or search_casefold in privilege_name:
+                    matched_privilege = True
+                    break
+            if matched_privilege:
+                filtered_items.append(item)
+                continue
+
+            matched_import = False
+            normalized_search = search_casefold.strip()
+            is_import_keyword = normalized_search in {"legacy import", "импорт", "import"}
+            for import_item in item.get("importedPrivileges", []):
+                server_name = str(import_item.get("serverName", "")).casefold()
+                privilege_name = str(import_item.get("privilege", "")).casefold()
+                nickname = str(import_item.get("nickname", "")).casefold()
+                steam_id = str(import_item.get("steamId", "")).casefold()
+                if (
+                    search_casefold in server_name
+                    or search_casefold in privilege_name
+                    or search_casefold in nickname
+                    or search_casefold in steam_id
+                    or is_import_keyword
+                ):
+                    matched_import = True
+                    break
+            if matched_import:
+                filtered_items.append(item)
+        all_items = filtered_items
+
+    all_items.sort(
+        key=lambda item: (
+            int(item.get("lastActivityAt", 0) or 0),
+            int(item.get("ltv", 0) or 0),
+            int(item.get("userId", 0) or 0),
+        ),
+        reverse=True,
+    )
+
+    total_items = len(all_items)
+    total_pages = max((total_items + safe_page_size - 1) // safe_page_size, 1)
+    if safe_page > total_pages:
+        safe_page = total_pages
+    start_index = (safe_page - 1) * safe_page_size
+    end_index = start_index + safe_page_size
+    page_items = all_items[start_index:end_index]
+
+    cashback_day = get_cashback_totals(start_ts=day_start_ts, end_ts=now_ts + 1)
+    cashback_week = get_cashback_totals(start_ts=week_start_ts, end_ts=now_ts + 1)
+    cashback_month = get_cashback_totals(start_ts=month_start_ts, end_ts=now_ts + 1)
+    cashback_total = get_cashback_totals()
+
+    summary = {
+        "totalUsers": len(profiles),
+        "activeUsers24h": int(active_users_count),
+        "usersWithBalance": int(users_with_balance),
+        "totalBalance": int(total_user_balance),
+        "payments": {
+            "day": purchase_metrics["day"],
+            "week": purchase_metrics["week"],
+            "month": purchase_metrics["month"],
+            "total": purchase_metrics["total"],
+        },
+        "topups": {
+            "day": topup_metrics["day"],
+            "week": topup_metrics["week"],
+            "month": topup_metrics["month"],
+            "total": topup_metrics["total"],
+        },
+        "privileges": privilege_metrics,
+        "cashback": {
+            "day": int(cashback_day),
+            "week": int(cashback_week),
+            "month": int(cashback_month),
+            "total": int(cashback_total),
+        },
+        "onboarding": {
+            "startedUsers": int(onboarding_metrics["startedUsers"]),
+            "welcomeBonusClaimedUsers": int(onboarding_metrics["welcomeBonusClaimedUsers"]),
+            "welcomeBonusClaimRate": float(onboarding_metrics["welcomeBonusClaimRate"]),
+            "welcomeBonusIssuedAmount": int(onboarding_metrics["welcomeBonusIssuedAmount"]),
+        },
+    }
+
+    return {
+        "summary": summary,
+        "items": page_items,
+        "page": int(safe_page),
+        "pageSize": int(safe_page_size),
+        "totalItems": int(total_items),
+        "totalPages": int(total_pages),
+        "search": safe_search,
+        "generatedAt": now_ts,
+    }
+
+
+def _normalize_broadcast_language(raw_value):
+    safe = str(raw_value or "").strip().lower()
+    return "uz" if safe == "uz" else "ru"
+
+
+def _normalize_broadcast_mode(raw_value):
+    safe = str(raw_value or "").strip().lower()
+    if safe in {"mass", "segment", "targeted"}:
+        return safe
+    return ""
+
+
+def _normalize_broadcast_campaign_status(raw_value):
+    safe = str(raw_value or "").strip().lower()
+    if safe in {"queued", "sending", "completed", "failed", "canceled"}:
+        return safe
+    return "queued"
+
+
+def _build_broadcast_profiles_snapshot():
+    now_local = datetime.datetime.now(REPORTS_TIMEZONE)
+    now_ts = int(now_local.timestamp())
+
+    with REPORTS_LOCK:
+        purchases = [
+            dict(item)
+            for item in REPORTS_STORE.setdefault("purchases", [])
+            if isinstance(item, dict)
+        ]
+        balances = dict(REPORTS_STORE.setdefault("balances", {})) if isinstance(REPORTS_STORE.get("balances"), dict) else {}
+        transactions = [
+            dict(item)
+            for item in REPORTS_STORE.setdefault("balance_transactions", [])
+            if isinstance(item, dict)
+        ]
+        welcome_bonus_claims = (
+            dict(REPORTS_STORE.setdefault("welcome_bonus_claims", {}))
+            if isinstance(REPORTS_STORE.get("welcome_bonus_claims"), dict)
+            else {}
+        )
+        user_activity = (
+            dict(REPORTS_STORE.setdefault("user_activity", {}))
+            if isinstance(REPORTS_STORE.get("user_activity"), dict)
+            else {}
+        )
+
+    active_privileges_map = _build_active_privileges_map_for_users(purchases, now_local)
+    profiles = {}
+
+    def get_profile(user_id):
+        profile = profiles.get(user_id)
+        if profile is not None:
+            return profile
+        profile = {
+            "userId": int(user_id),
+            "username": "",
+            "firstName": "",
+            "lastName": "",
+            "balance": 0,
+            "lastActivityAt": 0,
+            "hasActivePrivileges": False,
+            "welcomeBonusClaimed": False,
+            "language": "ru",
+            "_languageTs": 0,
+            "_purchasePrivileges": set(),
+            "_purchaseServers": set(),
+        }
+        profiles[user_id] = profile
+        return profile
+
+    for user_id_raw, balance_raw in balances.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+        normalized_balance = _normalize_balance_record(balance_raw)
+        profile["balance"] = max(_safe_int(normalized_balance.get("balance", 0), 0), 0)
+        profile["lastActivityAt"] = max(
+            profile["lastActivityAt"],
+            _safe_int(normalized_balance.get("updated_at", 0), 0),
+        )
+
+    for user_id_raw, activity_raw in user_activity.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+        activity = _normalize_user_activity_record(activity_raw)
+        activity_ts = _safe_int(activity.get("last_activity_at", 0), 0)
+        profile["lastActivityAt"] = max(profile["lastActivityAt"], activity_ts)
+        username = str(activity.get("username", "")).strip().lstrip("@")
+        if username and not profile["username"]:
+            profile["username"] = username
+        first_name = str(activity.get("first_name", "")).strip()
+        if first_name and not profile["firstName"]:
+            profile["firstName"] = first_name
+        last_name = str(activity.get("last_name", "")).strip()
+        if last_name and not profile["lastName"]:
+            profile["lastName"] = last_name
+        activity_language = _normalize_broadcast_language(activity.get("language", ""))
+        if activity_language and activity_ts >= int(profile.get("_languageTs", 0) or 0):
+            profile["language"] = activity_language
+            profile["_languageTs"] = activity_ts
+
+    for tx in transactions:
+        user_id = _safe_int(tx.get("user_id", 0), 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+        profile["lastActivityAt"] = max(
+            profile["lastActivityAt"],
+            _safe_int(tx.get("created_at", 0), 0),
+        )
+
+    for record in purchases:
+        user_id = _safe_int(record.get("user_id", 0), 0)
+        if user_id <= 0:
+            continue
+        profile = get_profile(user_id)
+
+        created_at = _safe_int(record.get("created_at", 0), 0)
+        if created_at > 0:
+            profile["lastActivityAt"] = max(profile["lastActivityAt"], created_at)
+
+        username = str(record.get("username", "")).strip().lstrip("@")
+        if username and not profile["username"]:
+            profile["username"] = username
+        first_name = str(record.get("first_name", "")).strip()
+        if first_name and not profile["firstName"]:
+            profile["firstName"] = first_name
+        last_name = str(record.get("last_name", "")).strip()
+        if last_name and not profile["lastName"]:
+            profile["lastName"] = last_name
+
+        language = _normalize_broadcast_language(record.get("language", ""))
+        if created_at >= int(profile.get("_languageTs", 0) or 0):
+            profile["language"] = language
+            profile["_languageTs"] = created_at
+
+        product_type = str(record.get("product_type", "")).strip().lower()
+        if product_type not in {PRODUCT_TYPE_PRIVILEGE, PRODUCT_TYPE_BONUS, PRODUCT_TYPE_LEGACY_IMPORT}:
+            continue
+
+        server_name = str(record.get("server", "")).strip()
+        if server_name:
+            profile["_purchaseServers"].add(server_name.casefold())
+        server_id = str(record.get("server_id", "")).strip()
+        resolved_server_id = _resolve_server_id_for_purchase_record(record) or server_id
+        if resolved_server_id:
+            profile["_purchaseServers"].add(str(resolved_server_id).casefold())
+
+        privilege_label = str(record.get("issued_privilege", "")).strip() or str(record.get("privilege", "")).strip()
+        if privilege_label:
+            profile["_purchasePrivileges"].add(privilege_label.casefold())
+
+    for user_id_raw, claim_raw in welcome_bonus_claims.items():
+        user_id = _safe_int(user_id_raw, 0)
+        if user_id <= 0:
+            continue
+        claim = _normalize_welcome_bonus_claim(claim_raw)
+        if _safe_int(claim.get("claimed_at", 0), 0) > 0:
+            profile = get_profile(user_id)
+            profile["welcomeBonusClaimed"] = True
+
+    for user_id, active_items in active_privileges_map.items():
+        profile = profiles.get(int(user_id))
+        if not profile:
+            continue
+        profile["hasActivePrivileges"] = bool(active_items)
+
+    items = []
+    for profile in profiles.values():
+        if _safe_int(profile.get("userId", 0), 0) <= 0:
+            continue
+        items.append(
+            {
+                "userId": int(profile.get("userId", 0)),
+                "username": str(profile.get("username", "")).strip().lstrip("@"),
+                "firstName": str(profile.get("firstName", "")).strip(),
+                "lastName": str(profile.get("lastName", "")).strip(),
+                "balance": int(max(_safe_int(profile.get("balance", 0), 0), 0)),
+                "lastActivityAt": int(max(_safe_int(profile.get("lastActivityAt", 0), 0), 0)),
+                "hasActivePrivileges": bool(profile.get("hasActivePrivileges")),
+                "welcomeBonusClaimed": bool(profile.get("welcomeBonusClaimed")),
+                "language": _normalize_broadcast_language(profile.get("language", "ru")),
+                "purchasePrivileges": sorted(list(profile.get("_purchasePrivileges", set()))),
+                "purchaseServers": sorted(list(profile.get("_purchaseServers", set()))),
+            }
+        )
+
+    items.sort(
+        key=lambda item: (
+            int(item.get("lastActivityAt", 0) or 0),
+            int(item.get("userId", 0) or 0),
+        ),
+        reverse=True,
+    )
+    return {
+        "generatedAt": now_ts,
+        "profiles": items,
+    }
+
+
+def _broadcast_profile_matches_filters(profile, filters, *, now_ts):
+    safe_filters = filters if isinstance(filters, dict) else {}
+
+    welcome_bonus_filter = str(safe_filters.get("welcomeBonus", "any")).strip().lower()
+    if welcome_bonus_filter == "claimed" and not bool(profile.get("welcomeBonusClaimed")):
+        return False
+    if welcome_bonus_filter == "not_claimed" and bool(profile.get("welcomeBonusClaimed")):
+        return False
+
+    balance_filter = str(safe_filters.get("balance", "any")).strip().lower()
+    balance_value = int(max(_safe_int(profile.get("balance", 0), 0), 0))
+    if balance_filter == "positive" and balance_value <= 0:
+        return False
+    if balance_filter == "zero" and balance_value != 0:
+        return False
+
+    active_privileges_filter = str(safe_filters.get("activePrivileges", "any")).strip().lower()
+    has_active_privileges = bool(profile.get("hasActivePrivileges"))
+    if active_privileges_filter == "yes" and not has_active_privileges:
+        return False
+    if active_privileges_filter == "no" and has_active_privileges:
+        return False
+
+    activity_mode = str(safe_filters.get("activityMode", "any")).strip().lower()
+    if activity_mode in {"active", "inactive"}:
+        activity_days = max(_safe_int(safe_filters.get("activityDays", 7), 7), 1)
+        threshold_ts = int(now_ts) - int(activity_days) * 86400
+        last_activity_at = int(max(_safe_int(profile.get("lastActivityAt", 0), 0), 0))
+        is_active = last_activity_at >= threshold_ts
+        if activity_mode == "active" and not is_active:
+            return False
+        if activity_mode == "inactive" and is_active:
+            return False
+
+    purchase_privilege_filter = str(safe_filters.get("purchasePrivilege", "")).strip().casefold()
+    if purchase_privilege_filter:
+        matched_privilege = False
+        for privilege_name in profile.get("purchasePrivileges", []):
+            if purchase_privilege_filter in str(privilege_name).casefold():
+                matched_privilege = True
+                break
+        if not matched_privilege:
+            return False
+
+    purchase_server_filter = str(safe_filters.get("purchaseServer", "")).strip().casefold()
+    if purchase_server_filter:
+        matched_server = False
+        for server_name in profile.get("purchaseServers", []):
+            if purchase_server_filter in str(server_name).casefold():
+                matched_server = True
+                break
+        if not matched_server:
+            return False
+
+    return True
+
+
+def _parse_targeted_user_ids(raw_values):
+    if isinstance(raw_values, str):
+        chunks = re.split(r"[\s,\n;]+", raw_values)
+    elif isinstance(raw_values, list):
+        chunks = raw_values
+    else:
+        chunks = []
+
+    user_ids = []
+    seen = set()
+    for raw_item in chunks:
+        safe_user_id = _safe_int(raw_item, 0)
+        if safe_user_id <= 0 or safe_user_id in seen:
+            continue
+        seen.add(safe_user_id)
+        user_ids.append(int(safe_user_id))
+    return user_ids
+
+
+def _parse_targeted_usernames(raw_values):
+    if isinstance(raw_values, str):
+        chunks = re.split(r"[\s,\n;]+", raw_values)
+    elif isinstance(raw_values, list):
+        chunks = raw_values
+    else:
+        chunks = []
+
+    usernames = []
+    seen = set()
+    for raw_item in chunks:
+        safe_username = str(raw_item or "").strip().lstrip("@")
+        if not safe_username:
+            continue
+        key = safe_username.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        usernames.append(safe_username)
+    return usernames
+
+
+def _build_broadcast_audience_label(mode, filters, target_user_ids, target_usernames):
+    if mode == "mass":
+        return "Массовая: всем пользователям"
+
+    if mode == "targeted":
+        return (
+            "Точечная: "
+            f"user_id={len(target_user_ids)} · "
+            f"username={len(target_usernames)}"
+        )
+
+    parts = []
+    safe_filters = filters if isinstance(filters, dict) else {}
+
+    welcome_bonus_filter = str(safe_filters.get("welcomeBonus", "any")).strip().lower()
+    if welcome_bonus_filter == "claimed":
+        parts.append("получал welcome-бонус")
+    elif welcome_bonus_filter == "not_claimed":
+        parts.append("не получал welcome-бонус")
+
+    balance_filter = str(safe_filters.get("balance", "any")).strip().lower()
+    if balance_filter == "positive":
+        parts.append("баланс > 0")
+    elif balance_filter == "zero":
+        parts.append("баланс = 0")
+
+    active_privileges_filter = str(safe_filters.get("activePrivileges", "any")).strip().lower()
+    if active_privileges_filter == "yes":
+        parts.append("есть активные привилегии")
+    elif active_privileges_filter == "no":
+        parts.append("нет активных привилегий")
+
+    activity_mode = str(safe_filters.get("activityMode", "any")).strip().lower()
+    if activity_mode in {"active", "inactive"}:
+        activity_days = max(_safe_int(safe_filters.get("activityDays", 7), 7), 1)
+        if activity_mode == "active":
+            parts.append(f"активен за {activity_days} дн.")
+        else:
+            parts.append(f"неактивен за {activity_days} дн.")
+
+    purchase_privilege = str(safe_filters.get("purchasePrivilege", "")).strip()
+    if purchase_privilege:
+        parts.append(f"покупал привилегию: {purchase_privilege}")
+
+    purchase_server = str(safe_filters.get("purchaseServer", "")).strip()
+    if purchase_server:
+        parts.append(f"покупал сервер: {purchase_server}")
+
+    if not parts:
+        return "Сегментная: без доп. фильтров"
+    return "Сегментная: " + ", ".join(parts)
+
+
+def _build_broadcast_recipients(*, mode, filters, target_user_ids, target_usernames):
+    snapshot = _build_broadcast_profiles_snapshot()
+    profiles = list(snapshot.get("profiles", []))
+    now_ts = int(snapshot.get("generatedAt", int(time.time())) or int(time.time()))
+
+    selected_profiles = []
+    missing_user_ids = []
+    missing_usernames = []
+
+    if mode == "mass":
+        selected_profiles = profiles
+    elif mode == "segment":
+        selected_profiles = [
+            profile
+            for profile in profiles
+            if _broadcast_profile_matches_filters(profile, filters, now_ts=now_ts)
+        ]
+    elif mode == "targeted":
+        by_user_id = {int(item.get("userId", 0)): item for item in profiles}
+        by_username = {
+            str(item.get("username", "")).strip().casefold(): item
+            for item in profiles
+            if str(item.get("username", "")).strip()
+        }
+        unique_user_ids = set()
+        for user_id in target_user_ids:
+            profile = by_user_id.get(int(user_id))
+            if profile is None:
+                missing_user_ids.append(int(user_id))
+                continue
+            unique_user_ids.add(int(profile.get("userId", 0)))
+
+        for raw_username in target_usernames:
+            profile = by_username.get(str(raw_username).strip().lstrip("@").casefold())
+            if profile is None:
+                missing_usernames.append(str(raw_username).strip().lstrip("@"))
+                continue
+            unique_user_ids.add(int(profile.get("userId", 0)))
+
+        selected_profiles = [
+            by_user_id[user_id]
+            for user_id in sorted(unique_user_ids)
+            if user_id in by_user_id
+        ]
+    else:
+        raise ValueError("Unsupported campaign mode")
+
+    recipients = []
+    for profile in selected_profiles:
+        user_id = int(_safe_int(profile.get("userId", 0), 0))
+        if user_id <= 0:
+            continue
+        recipients.append(
+            {
+                "userId": user_id,
+                "username": str(profile.get("username", "")).strip().lstrip("@"),
+                "firstName": str(profile.get("firstName", "")).strip(),
+                "lastName": str(profile.get("lastName", "")).strip(),
+                "language": _normalize_broadcast_language(profile.get("language", "ru")),
+            }
+        )
+
+    recipients.sort(key=lambda item: int(item.get("userId", 0) or 0))
+
+    sample = []
+    for item in recipients[:20]:
+        display_name = (
+            f"{str(item.get('firstName', '')).strip()} {str(item.get('lastName', '')).strip()}".strip()
+            or str(item.get("username", "")).strip()
+            or f"ID {item.get('userId')}"
+        )
+        sample.append(
+            {
+                "userId": int(item.get("userId", 0) or 0),
+                "username": str(item.get("username", "")).strip(),
+                "displayName": display_name,
+                "language": _normalize_broadcast_language(item.get("language", "ru")),
+            }
+        )
+
+    language_stats = {"ru": 0, "uz": 0}
+    for item in recipients:
+        safe_language = _normalize_broadcast_language(item.get("language", "ru"))
+        if safe_language == "uz":
+            language_stats["uz"] += 1
+        else:
+            language_stats["ru"] += 1
+
+    return {
+        "generatedAt": int(snapshot.get("generatedAt", now_ts) or now_ts),
+        "recipients": recipients,
+        "totalRecipients": len(recipients),
+        "sampleRecipients": sample,
+        "languageStats": language_stats,
+        "missingUserIds": missing_user_ids,
+        "missingUsernames": missing_usernames,
+    }
+
+
+def _normalize_admin_broadcast_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid payload")
+
+    mode = _normalize_broadcast_mode(payload.get("mode", ""))
+    if not mode:
+        raise ValueError("mode must be one of: mass, segment, targeted")
+
+    filters = payload.get("filters", {})
+    if not isinstance(filters, dict):
+        filters = {}
+
+    target = payload.get("target", {})
+    if not isinstance(target, dict):
+        target = {}
+    target_user_ids = _parse_targeted_user_ids(target.get("userIds", []))
+    target_usernames = _parse_targeted_usernames(target.get("usernames", []))
+
+    if mode == "targeted" and not target_user_ids and not target_usernames:
+        raise ValueError("Targeted mode requires at least one userId or username")
+
+    content = payload.get("content", {})
+    if not isinstance(content, dict):
+        content = {}
+
+    text_ru = str(content.get("textRu", "")).strip()
+    text_uz = str(content.get("textUz", "")).strip()
+    if len(text_ru) > 4000 or len(text_uz) > 4000:
+        raise ValueError("Message is too long (max 4000 chars per language)")
+
+    photo_data_url = str(content.get("photoDataUrl", "")).strip()
+    photo_name = str(content.get("photoName", "")).strip()
+    photo_mime = str(content.get("photoMimeType", "")).strip()
+    if photo_data_url:
+        _, detected_mime = decode_image_data_url(photo_data_url)
+        resolved_mime = (photo_mime or detected_mime or "image/jpeg").strip().lower()
+        photo_name = safe_filename(photo_name or "campaign-image", resolved_mime)
+        photo_mime = resolved_mime
+    else:
+        photo_name = ""
+        photo_mime = ""
+
+    button_url = str(content.get("buttonUrl", "")).strip()
+    button_text_ru = str(content.get("buttonTextRu", "")).strip()
+    button_text_uz = str(content.get("buttonTextUz", "")).strip()
+    if button_url:
+        if not re.match(r"^https?://", button_url, re.IGNORECASE):
+            raise ValueError("buttonUrl must start with http:// or https://")
+        if len(button_url) > 600:
+            raise ValueError("buttonUrl is too long")
+        if not button_text_ru and not button_text_uz:
+            button_text_ru = "Открыть"
+            button_text_uz = "Ochish"
+    else:
+        button_text_ru = ""
+        button_text_uz = ""
+
+    if not text_ru and not text_uz and not photo_data_url:
+        raise ValueError("Content is empty: add text and/or photo")
+
+    created_by = str(payload.get("createdBy", "")).strip()
+    if not created_by:
+        created_by = "admin_dashboard"
+    if len(created_by) > 80:
+        created_by = created_by[:80]
+
+    return {
+        "mode": mode,
+        "filters": filters,
+        "target": {
+            "userIds": target_user_ids,
+            "usernames": target_usernames,
+        },
+        "content": {
+            "textRu": text_ru,
+            "textUz": text_uz,
+            "photoDataUrl": photo_data_url,
+            "photoName": photo_name,
+            "photoMimeType": photo_mime,
+            "buttonUrl": button_url,
+            "buttonTextRu": button_text_ru,
+            "buttonTextUz": button_text_uz,
+        },
+        "createdBy": created_by,
+        "audienceLabel": _build_broadcast_audience_label(
+            mode,
+            filters,
+            target_user_ids,
+            target_usernames,
+        ),
+    }
+
+
+def _build_admin_broadcast_fingerprint(normalized_payload):
+    source = {
+        "mode": str(normalized_payload.get("mode", "")).strip(),
+        "filters": normalized_payload.get("filters", {}),
+        "target": normalized_payload.get("target", {}),
+        "content": normalized_payload.get("content", {}),
+    }
+    serialized = json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _cleanup_broadcast_previews_locked(now_ts):
+    safe_now = int(now_ts or time.time())
+    tokens_to_remove = []
+    for token, preview in BROADCAST_PREVIEWS.items():
+        if not isinstance(preview, dict):
+            tokens_to_remove.append(token)
+            continue
+        expires_at = int(preview.get("expiresAt", 0) or 0)
+        used = bool(preview.get("used"))
+        used_at = int(preview.get("usedAt", 0) or 0)
+        if expires_at > 0 and safe_now >= expires_at:
+            tokens_to_remove.append(token)
+            continue
+        if used and used_at > 0 and safe_now - used_at >= 3600:
+            tokens_to_remove.append(token)
+    for token in tokens_to_remove:
+        BROADCAST_PREVIEWS.pop(token, None)
+
+
+def create_admin_broadcast_preview(payload):
+    normalized = _normalize_admin_broadcast_payload(payload)
+    audience = _build_broadcast_recipients(
+        mode=normalized["mode"],
+        filters=normalized["filters"],
+        target_user_ids=normalized["target"]["userIds"],
+        target_usernames=normalized["target"]["usernames"],
+    )
+
+    now_ts = int(time.time())
+    preview_token = uuid.uuid4().hex
+    fingerprint = _build_admin_broadcast_fingerprint(normalized)
+
+    with BROADCAST_RUNTIME_LOCK:
+        _cleanup_broadcast_previews_locked(now_ts)
+        BROADCAST_PREVIEWS[preview_token] = {
+            "token": preview_token,
+            "createdAt": now_ts,
+            "expiresAt": now_ts + int(BROADCAST_PREVIEW_TTL_SECONDS),
+            "used": False,
+            "usedAt": 0,
+            "fingerprint": fingerprint,
+            "request": normalized,
+            "audience": audience,
+        }
+
+    return {
+        "previewToken": preview_token,
+        "fingerprint": fingerprint,
+        "expiresAt": now_ts + int(BROADCAST_PREVIEW_TTL_SECONDS),
+        "audience": {
+            "totalRecipients": int(audience.get("totalRecipients", 0) or 0),
+            "sampleRecipients": list(audience.get("sampleRecipients", [])),
+            "languageStats": dict(audience.get("languageStats", {"ru": 0, "uz": 0})),
+            "missingUserIds": list(audience.get("missingUserIds", [])),
+            "missingUsernames": list(audience.get("missingUsernames", [])),
+            "generatedAt": int(audience.get("generatedAt", now_ts) or now_ts),
+        },
+        "campaign": {
+            "mode": normalized["mode"],
+            "createdBy": normalized["createdBy"],
+            "audienceLabel": normalized["audienceLabel"],
+            "hasPhoto": bool(normalized["content"].get("photoDataUrl")),
+            "hasButton": bool(normalized["content"].get("buttonUrl")),
+        },
+    }
+
+
+def _find_broadcast_campaign_locked(campaigns, campaign_id):
+    safe_campaign_id = str(campaign_id or "").strip()
+    if not safe_campaign_id:
+        return -1, None
+    for index, campaign in enumerate(campaigns):
+        if not isinstance(campaign, dict):
+            continue
+        if str(campaign.get("id", "")).strip() == safe_campaign_id:
+            return index, campaign
+    return -1, None
+
+
+def _append_broadcast_campaign_log_locked(campaign, *, status, message="", recipient=None, error=""):
+    logs = campaign.setdefault("logs", [])
+    if not isinstance(logs, list):
+        logs = []
+        campaign["logs"] = logs
+
+    log_entry = {
+        "status": str(status or "").strip().lower() or "info",
+        "message": str(message or "").strip(),
+        "error": str(error or "").strip(),
+        "timestamp": int(time.time()),
+    }
+    if isinstance(recipient, dict):
+        user_id = _safe_int(recipient.get("userId", 0), 0)
+        if user_id > 0:
+            log_entry["userId"] = int(user_id)
+        username = str(recipient.get("username", "")).strip().lstrip("@")
+        if username:
+            log_entry["username"] = username
+
+    logs.append(log_entry)
+    if len(logs) > BROADCAST_CAMPAIGN_LOG_LIMIT:
+        del logs[: len(logs) - BROADCAST_CAMPAIGN_LOG_LIMIT]
+
+
+def _build_broadcast_campaign_summary(campaign, *, include_logs=False, logs_limit=250):
+    safe_campaign = campaign if isinstance(campaign, dict) else {}
+    stats = safe_campaign.get("stats", {}) if isinstance(safe_campaign.get("stats"), dict) else {}
+
+    payload = {
+        "id": str(safe_campaign.get("id", "")).strip(),
+        "status": _normalize_broadcast_campaign_status(safe_campaign.get("status", "")),
+        "mode": _normalize_broadcast_mode(safe_campaign.get("mode", "")),
+        "createdBy": str(safe_campaign.get("createdBy", "")).strip(),
+        "createdAt": int(_safe_int(safe_campaign.get("createdAt", 0), 0)),
+        "startedAt": int(_safe_int(safe_campaign.get("startedAt", 0), 0)),
+        "finishedAt": int(_safe_int(safe_campaign.get("finishedAt", 0), 0)),
+        "audienceLabel": str(safe_campaign.get("audienceLabel", "")).strip(),
+        "stats": {
+            "created": int(_safe_int(stats.get("created", 0), 0)),
+            "sent": int(_safe_int(stats.get("sent", 0), 0)),
+            "failed": int(_safe_int(stats.get("failed", 0), 0)),
+            "skipped": int(_safe_int(stats.get("skipped", 0), 0)),
+            "processed": int(_safe_int(stats.get("processed", 0), 0)),
+        },
+        "contentMeta": {
+            "hasPhoto": bool(safe_campaign.get("content", {}).get("photoDataUrl")) if isinstance(safe_campaign.get("content"), dict) else False,
+            "hasButton": bool(safe_campaign.get("content", {}).get("buttonUrl")) if isinstance(safe_campaign.get("content"), dict) else False,
+            "hasRu": bool(str(safe_campaign.get("content", {}).get("textRu", "")).strip()) if isinstance(safe_campaign.get("content"), dict) else False,
+            "hasUz": bool(str(safe_campaign.get("content", {}).get("textUz", "")).strip()) if isinstance(safe_campaign.get("content"), dict) else False,
+        },
+    }
+
+    if include_logs:
+        logs = safe_campaign.get("logs", [])
+        if not isinstance(logs, list):
+            logs = []
+        safe_limit = max(_safe_int(logs_limit, 250), 1)
+        safe_limit = min(safe_limit, 2000)
+        payload["logs"] = logs[-safe_limit:]
+        payload["totalLogs"] = len(logs)
+    return payload
+
+
+def get_admin_broadcast_campaigns(*, limit=30):
+    safe_limit = max(_safe_int(limit, 30), 1)
+    safe_limit = min(safe_limit, 120)
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            campaigns = []
+            REPORTS_STORE["broadcast_campaigns"] = campaigns
+        ordered = [
+            campaign
+            for campaign in campaigns
+            if isinstance(campaign, dict)
+        ]
+
+    ordered.sort(
+        key=lambda campaign: int(_safe_int(campaign.get("createdAt", 0), 0)),
+        reverse=True,
+    )
+    return [_build_broadcast_campaign_summary(item) for item in ordered[:safe_limit]]
+
+
+def get_admin_broadcast_campaign_details(campaign_id, *, logs_limit=300):
+    safe_campaign_id = str(campaign_id or "").strip()
+    if not safe_campaign_id:
+        raise ValueError("campaignId is required")
+
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            raise ValueError("Campaign not found")
+        _, campaign = _find_broadcast_campaign_locked(campaigns, safe_campaign_id)
+        if not campaign:
+            raise ValueError("Campaign not found")
+        return _build_broadcast_campaign_summary(
+            campaign,
+            include_logs=True,
+            logs_limit=logs_limit,
+        )
+
+
+def _build_broadcast_reply_markup(content, *, language):
+    safe_content = content if isinstance(content, dict) else {}
+    button_url = str(safe_content.get("buttonUrl", "")).strip()
+    if not button_url:
+        return None
+
+    button_text_ru = str(safe_content.get("buttonTextRu", "")).strip() or "Открыть"
+    button_text_uz = str(safe_content.get("buttonTextUz", "")).strip() or "Ochish"
+    safe_lang = _normalize_broadcast_language(language)
+    button_text = button_text_uz if safe_lang == "uz" else button_text_ru
+    if safe_lang == "uz" and not button_text:
+        button_text = button_text_ru
+    if safe_lang == "ru" and not button_text:
+        button_text = button_text_uz
+    button_text = button_text or "Open"
+
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(button_text, url=button_url)]]
+    ).to_dict()
+
+
+def _format_broadcast_text_for_telegram(raw_text):
+    safe_text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not safe_text:
+        return ""
+
+    escaped = html.escape(safe_text, quote=False)
+
+    # Simple markdown-like formatting for admin panel input.
+    escaped = re.sub(
+        r"\[(.+?)\]\((https?://[^\s)]+)\)",
+        lambda match: (
+            f'<a href="{html.escape(match.group(2), quote=True)}">{match.group(1)}</a>'
+        ),
+        escaped,
+        flags=re.DOTALL,
+    )
+    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"__(.+?)__", r"<i>\1</i>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"~~(.+?)~~", r"<s>\1</s>", escaped, flags=re.DOTALL)
+    escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\n{3,}", "\n\n", escaped)
+    return escaped.strip()
+
+
+def _resolve_broadcast_message_text(content, *, language):
+    safe_content = content if isinstance(content, dict) else {}
+    text_ru = str(safe_content.get("textRu", "")).strip()
+    text_uz = str(safe_content.get("textUz", "")).strip()
+    safe_lang = _normalize_broadcast_language(language)
+    if safe_lang == "uz":
+        selected_text = text_uz or text_ru
+    else:
+        selected_text = text_ru or text_uz
+    return _format_broadcast_text_for_telegram(selected_text)
+
+
+def _dispatch_broadcast_message_to_recipient(recipient, content, photo_payload):
+    user_id = _safe_int(recipient.get("userId", 0), 0) if isinstance(recipient, dict) else 0
+    if user_id <= 0:
+        return "skipped", "invalid_user_id"
+
+    language = _normalize_broadcast_language(recipient.get("language", "ru"))
+    text = _resolve_broadcast_message_text(content, language=language)
+    reply_markup = _build_broadcast_reply_markup(content, language=language)
+    has_photo = bool(isinstance(photo_payload, dict) and photo_payload.get("bytes"))
+    if not text and not has_photo:
+        return "skipped", "empty_content"
+
+    try:
+        if has_photo:
+            plain_text_len = len(re.sub(r"<[^>]+>", "", text or ""))
+            caption_text = text
+            send_text_after_photo = False
+            photo_reply_markup = reply_markup
+            text_reply_markup = reply_markup
+
+            # Telegram caption max is 1024 chars; use separate text message for long content.
+            if plain_text_len > 950:
+                caption_text = ""
+                send_text_after_photo = bool(text)
+                photo_reply_markup = None
+
+            telegram_send_photo(
+                user_id,
+                caption_text,
+                photo_payload["bytes"],
+                str(photo_payload.get("filename", "campaign.jpg")).strip() or "campaign.jpg",
+                str(photo_payload.get("mime", "image/jpeg")).strip() or "image/jpeg",
+                reply_markup=photo_reply_markup,
+            )
+            if send_text_after_photo:
+                telegram_send_message(user_id, text, reply_markup=text_reply_markup)
+        else:
+            telegram_send_message(user_id, text, reply_markup=reply_markup)
+    except (HTTPError, URLError, TimeoutError, ValueError) as error:
+        return "failed", _redact_sensitive_text(error)
+    except Exception as error:
+        return "failed", _redact_sensitive_text(error)
+
+    return "sent", ""
+
+
+def _send_broadcast_campaign_report_to_group(campaign, *, stage):
+    reports_chat_id = get_reports_chat_id()
+    if reports_chat_id is None:
+        return False
+
+    safe_campaign = campaign if isinstance(campaign, dict) else {}
+    stats = safe_campaign.get("stats", {}) if isinstance(safe_campaign.get("stats"), dict) else {}
+    campaign_id = str(safe_campaign.get("id", "")).strip() or "-"
+    created_by = html.escape(str(safe_campaign.get("createdBy", "")).strip() or "admin_dashboard")
+    mode = html.escape(str(safe_campaign.get("mode", "")).strip() or "-")
+    audience_label = html.escape(str(safe_campaign.get("audienceLabel", "")).strip() or "-")
+    total = int(_safe_int(stats.get("created", 0), 0))
+    sent = int(_safe_int(stats.get("sent", 0), 0))
+    failed = int(_safe_int(stats.get("failed", 0), 0))
+    skipped = int(_safe_int(stats.get("skipped", 0), 0))
+
+    if stage == "queued":
+        text = (
+            "📣 <b>Новая рассылка поставлена в очередь</b>\n"
+            f"🆔 <b>Campaign ID:</b> <code>{campaign_id}</code>\n"
+            f"🧑‍💼 <b>Кто запустил:</b> {created_by}\n"
+            f"🎯 <b>Тип:</b> {mode}\n"
+            f"👥 <b>Аудитория:</b> {audience_label}\n"
+            f"📦 <b>Получателей:</b> {total}\n"
+            "#broadcast_campaign"
+        )
+    else:
+        text = (
+            "✅ <b>Рассылка завершена</b>\n"
+            f"🆔 <b>Campaign ID:</b> <code>{campaign_id}</code>\n"
+            f"🧑‍💼 <b>Кто запустил:</b> {created_by}\n"
+            f"🎯 <b>Тип:</b> {mode}\n"
+            f"👥 <b>Аудитория:</b> {audience_label}\n"
+            f"📦 <b>Всего:</b> {total}\n"
+            f"✅ <b>Доставлено:</b> {sent}\n"
+            f"⚠️ <b>Ошибок:</b> {failed}\n"
+            f"⏭ <b>Пропущено:</b> {skipped}\n"
+            "#broadcast_campaign"
+        )
+
+    try:
+        response_payload = telegram_send_message(reports_chat_id, text)
+    except Exception as error:
+        print(
+            f"[BROADCAST ERROR] Failed to send campaign report: {_redact_sensitive_text(error)}",
+            file=sys.stderr,
+        )
+        return False
+    return bool(response_payload.get("ok"))
+
+
+def _enqueue_broadcast_campaign(campaign_id):
+    safe_campaign_id = str(campaign_id or "").strip()
+    if not safe_campaign_id:
+        return
+    with BROADCAST_RUNTIME_LOCK:
+        if safe_campaign_id in BROADCAST_QUEUE:
+            return
+        BROADCAST_QUEUE.append(safe_campaign_id)
+
+
+def _create_broadcast_campaign_from_preview(preview_token, *, confirm_send=False, confirm_phrase=""):
+    safe_preview_token = str(preview_token or "").strip()
+    if not safe_preview_token:
+        raise ValueError("previewToken is required")
+    if not bool(confirm_send):
+        raise ValueError("confirmSend must be true")
+    if str(confirm_phrase or "").strip().upper() != BROADCAST_SEND_CONFIRM_PHRASE:
+        raise ValueError(f"confirmPhrase must be {BROADCAST_SEND_CONFIRM_PHRASE}")
+
+    now_ts = int(time.time())
+    with BROADCAST_RUNTIME_LOCK:
+        _cleanup_broadcast_previews_locked(now_ts)
+        preview = BROADCAST_PREVIEWS.get(safe_preview_token)
+        if not isinstance(preview, dict):
+            raise ValueError("Preview is expired or not found")
+        if bool(preview.get("used")):
+            raise ValueError("This preview was already used. Generate a new preview.")
+        expires_at = int(preview.get("expiresAt", 0) or 0)
+        if expires_at > 0 and now_ts >= expires_at:
+            BROADCAST_PREVIEWS.pop(safe_preview_token, None)
+            raise ValueError("Preview is expired. Generate a new preview.")
+        preview["used"] = True
+        preview["usedAt"] = now_ts
+
+        safe_request = dict(preview.get("request", {})) if isinstance(preview.get("request"), dict) else {}
+        safe_audience = dict(preview.get("audience", {})) if isinstance(preview.get("audience"), dict) else {}
+
+    recipients = [
+        dict(item)
+        for item in safe_audience.get("recipients", [])
+        if isinstance(item, dict)
+    ]
+    recipients_count = len(recipients)
+    campaign_id = uuid.uuid4().hex[:14]
+
+    campaign = {
+        "id": campaign_id,
+        "status": "queued",
+        "mode": _normalize_broadcast_mode(safe_request.get("mode", "")),
+        "createdBy": str(safe_request.get("createdBy", "")).strip() or "admin_dashboard",
+        "createdAt": now_ts,
+        "startedAt": 0,
+        "finishedAt": 0,
+        "audienceLabel": str(safe_request.get("audienceLabel", "")).strip(),
+        "filters": safe_request.get("filters", {}) if isinstance(safe_request.get("filters"), dict) else {},
+        "target": safe_request.get("target", {}) if isinstance(safe_request.get("target"), dict) else {},
+        "content": safe_request.get("content", {}) if isinstance(safe_request.get("content"), dict) else {},
+        "recipients": recipients,
+        "stats": {
+            "created": recipients_count,
+            "sent": 0,
+            "failed": 0,
+            "skipped": 0,
+            "processed": 0,
+        },
+        "logs": [],
+    }
+    _append_broadcast_campaign_log_locked(
+        campaign,
+        status="created",
+        message="Campaign created and queued",
+    )
+
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            campaigns = []
+            REPORTS_STORE["broadcast_campaigns"] = campaigns
+        campaigns.insert(0, campaign)
+        if len(campaigns) > BROADCAST_CAMPAIGN_MAX_KEEP:
+            del campaigns[BROADCAST_CAMPAIGN_MAX_KEEP:]
+        _save_reports_store_locked()
+
+    _enqueue_broadcast_campaign(campaign_id)
+    _send_broadcast_campaign_report_to_group(campaign, stage="queued")
+    return _build_broadcast_campaign_summary(campaign, include_logs=True, logs_limit=40)
+
+
+def _process_broadcast_campaign(campaign_id):
+    safe_campaign_id = str(campaign_id or "").strip()
+    if not safe_campaign_id:
+        return
+
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            return
+        _, campaign = _find_broadcast_campaign_locked(campaigns, safe_campaign_id)
+        if not campaign:
+            return
+        status = _normalize_broadcast_campaign_status(campaign.get("status", ""))
+        if status in {"completed", "failed", "canceled"}:
+            return
+
+        campaign["status"] = "sending"
+        campaign["startedAt"] = int(time.time())
+        _append_broadcast_campaign_log_locked(campaign, status="info", message="Campaign started")
+        _save_reports_store_locked()
+        recipients = [
+            dict(item)
+            for item in campaign.get("recipients", [])
+            if isinstance(item, dict)
+        ]
+        content = dict(campaign.get("content", {})) if isinstance(campaign.get("content"), dict) else {}
+
+    photo_payload = None
+    photo_data_url = str(content.get("photoDataUrl", "")).strip()
+    if photo_data_url:
+        try:
+            photo_bytes, detected_mime = decode_image_data_url(photo_data_url)
+            photo_payload = {
+                "bytes": photo_bytes,
+                "mime": str(content.get("photoMimeType", "")).strip() or detected_mime,
+                "filename": safe_filename(
+                    str(content.get("photoName", "")).strip() or "campaign-image",
+                    str(content.get("photoMimeType", "")).strip() or detected_mime,
+                ),
+            }
+        except Exception as error:
+            with REPORTS_LOCK:
+                campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+                if not isinstance(campaigns, list):
+                    return
+                _, failed_campaign = _find_broadcast_campaign_locked(campaigns, safe_campaign_id)
+                if not failed_campaign:
+                    return
+                failed_campaign["status"] = "failed"
+                failed_campaign["finishedAt"] = int(time.time())
+                _append_broadcast_campaign_log_locked(
+                    failed_campaign,
+                    status="failed",
+                    message="Failed to decode campaign photo",
+                    error=_redact_sensitive_text(error),
+                )
+                _save_reports_store_locked()
+            return
+
+    delay_seconds = 1.0 / float(BROADCAST_MESSAGES_PER_SECOND)
+    unsaved_updates = 0
+
+    for recipient in recipients:
+        result_status, result_error = _dispatch_broadcast_message_to_recipient(recipient, content, photo_payload)
+
+        with REPORTS_LOCK:
+            campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+            if not isinstance(campaigns, list):
+                return
+            _, current_campaign = _find_broadcast_campaign_locked(campaigns, safe_campaign_id)
+            if not current_campaign:
+                return
+
+            stats = current_campaign.setdefault("stats", {})
+            if not isinstance(stats, dict):
+                stats = {}
+                current_campaign["stats"] = stats
+            stats["created"] = int(_safe_int(stats.get("created", 0), 0))
+            stats["sent"] = int(_safe_int(stats.get("sent", 0), 0))
+            stats["failed"] = int(_safe_int(stats.get("failed", 0), 0))
+            stats["skipped"] = int(_safe_int(stats.get("skipped", 0), 0))
+
+            if result_status == "sent":
+                stats["sent"] += 1
+                _append_broadcast_campaign_log_locked(
+                    current_campaign,
+                    status="sent",
+                    message="Delivered",
+                    recipient=recipient,
+                )
+            elif result_status == "failed":
+                stats["failed"] += 1
+                _append_broadcast_campaign_log_locked(
+                    current_campaign,
+                    status="failed",
+                    message="Delivery failed",
+                    recipient=recipient,
+                    error=result_error,
+                )
+            else:
+                stats["skipped"] += 1
+                _append_broadcast_campaign_log_locked(
+                    current_campaign,
+                    status="skipped",
+                    message=result_error or "Skipped",
+                    recipient=recipient,
+                )
+
+            stats["processed"] = (
+                int(_safe_int(stats.get("sent", 0), 0))
+                + int(_safe_int(stats.get("failed", 0), 0))
+                + int(_safe_int(stats.get("skipped", 0), 0))
+            )
+            unsaved_updates += 1
+            if unsaved_updates >= 15 or result_status != "sent":
+                _save_reports_store_locked()
+                unsaved_updates = 0
+
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            return
+        _, completed_campaign = _find_broadcast_campaign_locked(campaigns, safe_campaign_id)
+        if not completed_campaign:
+            return
+        completed_campaign["status"] = "completed"
+        completed_campaign["finishedAt"] = int(time.time())
+        _append_broadcast_campaign_log_locked(
+            completed_campaign,
+            status="info",
+            message="Campaign finished",
+        )
+        _save_reports_store_locked()
+        report_campaign = dict(completed_campaign)
+
+    _send_broadcast_campaign_report_to_group(report_campaign, stage="completed")
+
+
+def _restore_pending_broadcast_campaigns_to_queue():
+    pending_ids = []
+    should_save = False
+    with REPORTS_LOCK:
+        campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+        if not isinstance(campaigns, list):
+            return
+        for campaign in campaigns:
+            if not isinstance(campaign, dict):
+                continue
+            campaign_id = str(campaign.get("id", "")).strip()
+            if not campaign_id:
+                continue
+            status = _normalize_broadcast_campaign_status(campaign.get("status", ""))
+            if status == "sending":
+                campaign["status"] = "queued"
+                status = "queued"
+                should_save = True
+            if status == "queued":
+                pending_ids.append(campaign_id)
+        if should_save:
+            _save_reports_store_locked()
+
+    for campaign_id in pending_ids:
+        _enqueue_broadcast_campaign(campaign_id)
+
+
+def _broadcast_worker_loop():
+    while True:
+        campaign_id = ""
+        with BROADCAST_RUNTIME_LOCK:
+            if BROADCAST_QUEUE:
+                campaign_id = str(BROADCAST_QUEUE.popleft()).strip()
+        if not campaign_id:
+            time.sleep(BROADCAST_QUEUE_IDLE_SECONDS)
+            continue
+        try:
+            _process_broadcast_campaign(campaign_id)
+        except Exception as error:
+            print(
+                f"[BROADCAST ERROR] Worker failed for campaign={campaign_id}: {_redact_sensitive_text(error)}",
+                file=sys.stderr,
+            )
+            with REPORTS_LOCK:
+                campaigns = REPORTS_STORE.setdefault("broadcast_campaigns", [])
+                if isinstance(campaigns, list):
+                    _, failed_campaign = _find_broadcast_campaign_locked(campaigns, campaign_id)
+                    if failed_campaign:
+                        failed_campaign["status"] = "failed"
+                        failed_campaign["finishedAt"] = int(time.time())
+                        _append_broadcast_campaign_log_locked(
+                            failed_campaign,
+                            status="failed",
+                            message="Unexpected worker error",
+                            error=_redact_sensitive_text(error),
+                        )
+                        _save_reports_store_locked()
+
+
+def start_broadcast_worker():
+    global BROADCAST_WORKER_STARTED
+    with BROADCAST_RUNTIME_LOCK:
+        if BROADCAST_WORKER_STARTED:
+            return
+        BROADCAST_WORKER_STARTED = True
+
+    _restore_pending_broadcast_campaigns_to_queue()
+    thread = threading.Thread(
+        target=_broadcast_worker_loop,
+        daemon=True,
+        name="broadcast-worker",
+    )
+    thread.start()
+    print(
+        f"Broadcast worker started (rate={BROADCAST_MESSAGES_PER_SECOND:.1f} msg/s, preview_ttl={BROADCAST_PREVIEW_TTL_SECONDS}s)."
+    )
+
+
 def _folder_name_variants(raw_folder_name):
     value = str(raw_folder_name or "").strip().strip("/").lower()
     if not value:
@@ -661,7 +2691,7 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
             if isinstance(item, dict)
             and int(item.get("user_id", 0) or 0) == safe_user_id
             and str(item.get("status", "")).strip().lower() == "active"
-            and str(item.get("product_type", "privilege")).strip().lower() == "privilege"
+            and _is_active_privilege_product_type(item.get("product_type", PRODUCT_TYPE_PRIVILEGE))
         ]
 
     user_privilege_records.sort(
@@ -691,14 +2721,11 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
         if account_key in seen_account_keys:
             continue
 
-        duration_months = max(int(record.get("duration_months", 0) or 0), 0)
-        calculated_total_days = duration_months * 30
-        issued_after_days = max(int(record.get("issued_after_days", 0) or 0), 0)
-        total_days = max(issued_after_days, calculated_total_days, 30)
-
-        created_local_dt = datetime.datetime.fromtimestamp(created_at, tz=REPORTS_TIMEZONE)
-        days_passed = max((now_local.date() - created_local_dt.date()).days, 0)
-        remaining_days = max(total_days - days_passed, 0)
+        lifecycle = _extract_privilege_lifecycle_from_record(record, now_local=now_local)
+        total_days = int(lifecycle.get("total_days", 0))
+        days_passed = int(lifecycle.get("days_passed", 0))
+        remaining_days = int(lifecycle.get("remaining_days", 0))
+        is_permanent = bool(lifecycle.get("is_permanent"))
         if remaining_days <= 0:
             continue
 
@@ -724,6 +2751,9 @@ def get_user_privilege_snapshots(user_id, *, limit=30):
                 "total_days": int(total_days),
                 "days_passed": int(days_passed),
                 "can_renew": bool(server_id and privilege_key),
+                "source": str(record.get("source", "")).strip().lower(),
+                "password": str(record.get("renew_password", "")).strip(),
+                "is_permanent": bool(is_permanent),
             }
         )
         if len(snapshots) >= max_items:
@@ -872,6 +2902,13 @@ BONUS_TARIFF_PRICE_BY_BONUS_AMOUNT = {
 }
 DEFAULT_PURCHASE_CASHBACK_PERCENT = 5
 LEGEND_PURCHASE_CASHBACK_PERCENT = 10
+PRODUCT_TYPE_PRIVILEGE = "privilege"
+PRODUCT_TYPE_BONUS = "bonus"
+PRODUCT_TYPE_LEGACY_IMPORT = "legacy_import"
+ACTIVE_PRIVILEGE_PRODUCT_TYPES = {
+    PRODUCT_TYPE_PRIVILEGE,
+    PRODUCT_TYPE_LEGACY_IMPORT,
+}
 
 
 def _normalize_server_port(server_id):
@@ -1188,6 +3225,242 @@ def _sanitize_privilege_identifier(identifier_type, nickname="", steam_id=""):
     return normalized_type, _sanitize_nickname(nickname)
 
 
+def _is_active_privilege_product_type(product_type):
+    normalized = str(product_type or PRODUCT_TYPE_PRIVILEGE).strip().lower()
+    return normalized in ACTIVE_PRIVILEGE_PRODUCT_TYPES
+
+
+def _build_duration_label(months, language="ru"):
+    try:
+        safe_months = max(int(months), 1)
+    except (TypeError, ValueError):
+        safe_months = 1
+
+    normalized_language = str(language or "ru").strip().lower()
+    if normalized_language == "uz":
+        return f"{safe_months} oyga"
+
+    if safe_months == 1:
+        return "На 1 месяц"
+    if 2 <= safe_months <= 4:
+        return f"На {safe_months} месяца"
+    return f"На {safe_months} месяцев"
+
+
+def _normalize_total_days_for_import(days_remaining):
+    try:
+        safe_days = max(int(days_remaining), 0)
+    except (TypeError, ValueError):
+        safe_days = 0
+    if safe_days <= 0:
+        return 30
+    return max(((safe_days + 29) // 30) * 30, 30)
+
+
+def _extract_privilege_lifecycle_from_record(record, *, now_local=None):
+    if not isinstance(record, dict):
+        return {
+            "created_at": 0,
+            "total_days": 0,
+            "days_passed": 0,
+            "remaining_days": 0,
+            "is_permanent": False,
+        }
+
+    created_at = _safe_int(record.get("created_at", 0), 0)
+    if created_at <= 0:
+        return {
+            "created_at": 0,
+            "total_days": 0,
+            "days_passed": 0,
+            "remaining_days": 0,
+            "is_permanent": False,
+        }
+
+    is_permanent = bool(record.get("is_permanent")) or bool(record.get("imported_is_permanent"))
+    if is_permanent:
+        # Keep permanent privileges always active in lifecycle checks.
+        return {
+            "created_at": int(created_at),
+            "total_days": 1,
+            "days_passed": 0,
+            "remaining_days": 1,
+            "is_permanent": True,
+        }
+
+    safe_now_local = now_local or datetime.datetime.now(REPORTS_TIMEZONE)
+    created_local_dt = datetime.datetime.fromtimestamp(created_at, tz=REPORTS_TIMEZONE)
+    days_passed = max((safe_now_local.date() - created_local_dt.date()).days, 0)
+
+    product_type = str(record.get("product_type", "")).strip().lower()
+    source = str(record.get("source", "")).strip().lower()
+    is_legacy_import = product_type == PRODUCT_TYPE_LEGACY_IMPORT or source == PRODUCT_TYPE_LEGACY_IMPORT
+    if is_legacy_import:
+        imported_remaining_days = max(_safe_int(record.get("imported_remaining_days", 0), 0), 0)
+        imported_total_days = max(_safe_int(record.get("imported_total_days", 0), 0), 0)
+        issued_after_days = max(_safe_int(record.get("issued_after_days", 0), 0), 0)
+        initial_remaining_days = max(imported_remaining_days, issued_after_days, 0)
+        if initial_remaining_days > 0:
+            total_days = max(
+                imported_total_days,
+                _normalize_total_days_for_import(initial_remaining_days),
+                initial_remaining_days,
+            )
+            remaining_days = max(initial_remaining_days - days_passed, 0)
+            return {
+                "created_at": int(created_at),
+                "total_days": int(total_days),
+                "days_passed": int(days_passed),
+                "remaining_days": int(remaining_days),
+                "is_permanent": False,
+            }
+
+    duration_months = max(_safe_int(record.get("duration_months", 0), 0), 0)
+    calculated_total_days = duration_months * 30
+    issued_after_days = max(_safe_int(record.get("issued_after_days", 0), 0), 0)
+    total_days = max(issued_after_days, calculated_total_days, 30)
+    remaining_days = max(total_days - days_passed, 0)
+    return {
+        "created_at": int(created_at),
+        "total_days": int(total_days),
+        "days_passed": int(days_passed),
+        "remaining_days": int(remaining_days),
+        "is_permanent": False,
+    }
+
+
+def _build_privilege_binding_key(*, server_id="", server_name="", identifier_type="", identifier_value=""):
+    safe_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    safe_value = str(identifier_value or "").strip()
+    if not safe_value:
+        return ""
+
+    if safe_identifier_type == PRIVILEGE_IDENTIFIER_STEAM:
+        normalized_value = normalize_steam_id(safe_value)
+    else:
+        normalized_value = safe_value.casefold()
+
+    safe_server_id = str(server_id or "").strip()
+    safe_server_name = str(server_name or "").strip().casefold()
+    server_part = safe_server_id if safe_server_id else safe_server_name
+    if not server_part:
+        return ""
+
+    return "|".join([server_part, safe_identifier_type, normalized_value])
+
+
+def _find_active_privilege_owner(*, server_id="", server_name="", identifier_type="", nickname="", steam_id=""):
+    safe_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    identifier_value = normalize_steam_id(steam_id) if safe_identifier_type == PRIVILEGE_IDENTIFIER_STEAM else str(nickname or "").strip()
+    binding_key = _build_privilege_binding_key(
+        server_id=server_id,
+        server_name=server_name,
+        identifier_type=safe_identifier_type,
+        identifier_value=identifier_value,
+    )
+    if not binding_key:
+        return None
+
+    now_local = datetime.datetime.now(REPORTS_TIMEZONE)
+    with REPORTS_LOCK:
+        purchases = REPORTS_STORE.setdefault("purchases", [])
+        if not isinstance(purchases, list):
+            return None
+        candidate_records = [dict(item) for item in purchases if isinstance(item, dict)]
+
+    for record in candidate_records:
+        if str(record.get("status", "")).strip().lower() != "active":
+            continue
+        if not _is_active_privilege_product_type(record.get("product_type", PRODUCT_TYPE_PRIVILEGE)):
+            continue
+
+        lifecycle = _extract_privilege_lifecycle_from_record(record, now_local=now_local)
+        if int(lifecycle.get("remaining_days", 0)) <= 0:
+            continue
+
+        resolved_server_id = _resolve_server_id_for_purchase_record(record)
+        resolved_identifier_type = normalize_privilege_identifier_type(
+            record.get("issued_identifier_type", record.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME))
+        )
+        resolved_nickname = str(record.get("nickname", "")).strip()
+        resolved_steam_id = normalize_steam_id(record.get("steam_id", ""))
+        resolved_identifier_value = (
+            resolved_steam_id if resolved_identifier_type == PRIVILEGE_IDENTIFIER_STEAM else resolved_nickname
+        )
+        record_key = _build_privilege_binding_key(
+            server_id=resolved_server_id,
+            server_name=str(record.get("server", "")).strip(),
+            identifier_type=resolved_identifier_type,
+            identifier_value=resolved_identifier_value,
+        )
+        if record_key != binding_key:
+            continue
+
+        return {
+            "user_id": _safe_int(record.get("user_id", 0), 0),
+            "username": str(record.get("username", "")).strip().lstrip("@"),
+            "first_name": str(record.get("first_name", "")).strip(),
+            "last_name": str(record.get("last_name", "")).strip(),
+            "purchase_id": str(record.get("id", "")).strip(),
+            "server_id": str(resolved_server_id or "").strip(),
+            "server_name": str(record.get("server", "")).strip(),
+            "identifier_type": resolved_identifier_type,
+            "nickname": resolved_nickname,
+            "steam_id": resolved_steam_id,
+            "remaining_days": int(lifecycle.get("remaining_days", 0)),
+            "total_days": int(lifecycle.get("total_days", 0)),
+            "is_permanent": bool(lifecycle.get("is_permanent")),
+        }
+
+    return None
+
+
+def append_user_balance_transaction(
+    *,
+    user_id,
+    transaction_type,
+    delta=0,
+    before=0,
+    after=0,
+    metadata=None,
+    created_at=0,
+):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        return ""
+
+    safe_delta = _safe_int(delta, 0)
+    safe_before = max(_safe_int(before, 0), 0)
+    safe_after = max(_safe_int(after, 0), 0)
+    safe_created_at = max(_safe_int(created_at, 0), int(time.time()))
+    safe_type = str(transaction_type or "").strip().lower() or "adjustment"
+    tx_metadata = metadata if isinstance(metadata, dict) else {}
+    tx_id = uuid.uuid4().hex[:14]
+
+    with REPORTS_LOCK:
+        transactions = REPORTS_STORE.setdefault("balance_transactions", [])
+        if not isinstance(transactions, list):
+            transactions = []
+            REPORTS_STORE["balance_transactions"] = transactions
+        transactions.append(
+            {
+                "id": tx_id,
+                "created_at": int(safe_created_at),
+                "user_id": int(safe_user_id),
+                "type": safe_type,
+                "delta": int(safe_delta),
+                "before": int(safe_before),
+                "after": int(safe_after),
+                "meta": dict(tx_metadata),
+            }
+        )
+        if len(transactions) > 5000:
+            del transactions[: len(transactions) - 5000]
+        _save_reports_store_locked()
+
+    return tx_id
+
+
 def _build_users_ini_entry(*, identifier_value, password, privilege_flags, access_mode, duration_days):
     return (
         f"\"{identifier_value}\" \"{password}\" \"{privilege_flags}\" "
@@ -1406,7 +3679,9 @@ def _verify_privilege_password_from_users_ini(
     *,
     server_id,
     server_name,
-    nickname,
+    identifier_type=PRIVILEGE_IDENTIFIER_NICKNAME,
+    nickname="",
+    steam_id="",
     password,
 ):
     users_ini_path = _resolve_ftp_users_ini_path(server_id, server_name, raise_if_missing=False)
@@ -1417,18 +3692,22 @@ def _verify_privilege_password_from_users_ini(
             "valid": False,
         }
 
-    safe_nickname = _sanitize_nickname(nickname)
+    resolved_identifier_type, resolved_identifier_value = _sanitize_privilege_identifier(
+        identifier_type=identifier_type,
+        nickname=nickname,
+        steam_id=steam_id,
+    )
     safe_password = _sanitize_password(password)
     users_ini_bytes = _download_users_ini_bytes(users_ini_path)
     users_ini_text = users_ini_bytes.decode("latin-1")
     lines = users_ini_text.splitlines(keepends=True)
-    found = _find_users_ini_entry(lines, PRIVILEGE_IDENTIFIER_NICKNAME, safe_nickname)
+    found = _find_users_ini_entry(lines, resolved_identifier_type, resolved_identifier_value)
     if not found:
         return {
             "supported": True,
             "exists": False,
             "valid": False,
-            "identifier_type": PRIVILEGE_IDENTIFIER_NICKNAME,
+            "identifier_type": resolved_identifier_type,
         }
 
     is_valid = safe_password == found["password"]
@@ -1437,8 +3716,13 @@ def _verify_privilege_password_from_users_ini(
         "supported": True,
         "exists": True,
         "valid": is_valid,
-        "identifier_type": PRIVILEGE_IDENTIFIER_NICKNAME,
-        "nickname": found["nickname"],
+        "identifier_type": resolved_identifier_type,
+        "nickname": found["nickname"] if resolved_identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME else "",
+        "steam_id": (
+            normalize_steam_id(found["nickname"])
+            if resolved_identifier_type == PRIVILEGE_IDENTIFIER_STEAM
+            else ""
+        ),
         "flags": found["flags"],
         "privilege": _label_for_privilege_flags(found["flags"]),
         "days": days_value,
@@ -1558,6 +3842,7 @@ def issue_privilege_via_ftp_if_required(
             "identifier_value": resolved_identifier_value,
             "nickname": resolved_identifier_value if not is_steam_identifier else "",
             "steam_id": resolved_identifier_value if is_steam_identifier else "",
+            "effective_password": final_password if not is_steam_identifier else "",
         }
 
     if bool(found.get("is_permanent")):
@@ -1663,6 +3948,314 @@ def issue_privilege_via_ftp_if_required(
         "identifier_value": resolved_identifier_value,
         "nickname": found["nickname"] if not is_steam_identifier else "",
         "steam_id": normalize_steam_id(found["nickname"]) if is_steam_identifier else "",
+        "effective_password": resulting_password if not is_steam_identifier else "",
+    }
+
+
+def _localize_legacy_import_message(message_key, language="ru"):
+    normalized_language = str(language or "ru").strip().lower()
+    use_uz = normalized_language == "uz"
+    ru_messages = {
+        "invalid_user": "Не удалось определить Telegram-пользователя. Откройте миниапп снова.",
+        "unknown_server": "Сервер не найден.",
+        "identifier_required": "Укажите Nick или STEAM_ID.",
+        "password_required": "Введите пароль от привилегии.",
+        "password_invalid": "Пароль неверный.",
+        "account_not_found": "Активная привилегия не найдена для указанных данных.",
+        "account_expired": "Привилегия найдена, но уже истекла.",
+        "account_disabled": "Привилегия найдена, но отключена в users.ini.",
+        "account_permanent_not_supported": "Постоянные привилегии импортируются только через администратора.",
+        "privilege_unsupported": "Тип привилегии не поддерживается для импорта.",
+        "already_linked_other": "Эта привилегия уже привязана к другому Telegram аккаунту. Обратитесь к администратору.",
+        "ftp_failed": "Не удалось проверить users.ini. Попробуйте позже.",
+    }
+    uz_messages = {
+        "invalid_user": "Telegram foydalanuvchisi aniqlanmadi. Miniappni qayta oching.",
+        "unknown_server": "Server topilmadi.",
+        "identifier_required": "Nick yoki STEAM_ID ni kiriting.",
+        "password_required": "Imtiyoz parolini kiriting.",
+        "password_invalid": "Parol noto'g'ri.",
+        "account_not_found": "Ko'rsatilgan ma'lumotlar bo'yicha faol imtiyoz topilmadi.",
+        "account_expired": "Imtiyoz topildi, lekin muddati tugagan.",
+        "account_disabled": "Imtiyoz topildi, lekin users.ini ichida o'chirilgan.",
+        "account_permanent_not_supported": "Doimiy imtiyozlar faqat administrator orqali import qilinadi.",
+        "privilege_unsupported": "Bu imtiyoz turi import uchun qo'llab-quvvatlanmaydi.",
+        "already_linked_other": "Bu imtiyoz boshqa Telegram akkauntga biriktirilgan. Administratorga murojaat qiling.",
+        "ftp_failed": "users.ini ni tekshirib bo'lmadi. Keyinroq qayta urinib ko'ring.",
+    }
+    catalog = uz_messages if use_uz else ru_messages
+    return catalog.get(str(message_key or "").strip(), catalog["ftp_failed"])
+
+
+def _find_user_privilege_snapshot_by_binding(
+    *,
+    user_id,
+    server_id="",
+    server_name="",
+    identifier_type=PRIVILEGE_IDENTIFIER_NICKNAME,
+    nickname="",
+    steam_id="",
+):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        return None
+
+    safe_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    identifier_value = (
+        normalize_steam_id(steam_id)
+        if safe_identifier_type == PRIVILEGE_IDENTIFIER_STEAM
+        else str(nickname or "").strip()
+    )
+    target_key = _build_privilege_binding_key(
+        server_id=server_id,
+        server_name=server_name,
+        identifier_type=safe_identifier_type,
+        identifier_value=identifier_value,
+    )
+    if not target_key:
+        return None
+
+    snapshots = get_user_privilege_snapshots(safe_user_id, limit=120)
+    for item in snapshots:
+        item_key = _build_privilege_binding_key(
+            server_id=str(item.get("server_id", "")).strip(),
+            server_name=str(item.get("server_name", "")).strip(),
+            identifier_type=str(item.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME)),
+            identifier_value=(
+                str(item.get("steam_id", "")).strip()
+                if normalize_privilege_identifier_type(item.get("identifier_type")) == PRIVILEGE_IDENTIFIER_STEAM
+                else str(item.get("nickname", "")).strip()
+            ),
+        )
+        if item_key == target_key:
+            return item
+    return None
+
+
+def import_legacy_privilege_binding(
+    *,
+    user_id,
+    username="",
+    first_name="",
+    last_name="",
+    server_id="",
+    server_name="",
+    identifier_type=PRIVILEGE_IDENTIFIER_NICKNAME,
+    nickname="",
+    steam_id="",
+    password="",
+    language="ru",
+):
+    safe_user_id = _safe_int(user_id, 0)
+    if safe_user_id <= 0:
+        raise ValueError(_localize_legacy_import_message("invalid_user", language))
+
+    safe_server_id = str(server_id or "").strip()
+    safe_server_name = str(server_name or "").strip()
+    if not safe_server_id or not _is_known_server(safe_server_id):
+        raise ValueError(_localize_legacy_import_message("unknown_server", language))
+
+    normalized_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    safe_nickname = ""
+    safe_steam_id = ""
+    safe_password = ""
+
+    try:
+        if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM:
+            safe_steam_id = normalize_steam_id(steam_id)
+            if not is_valid_steam_id(safe_steam_id):
+                raise ValueError(_localize_legacy_import_message("identifier_required", language))
+            safe_password = _sanitize_password(password)
+        else:
+            safe_nickname = _sanitize_nickname(nickname)
+            safe_password = _sanitize_password(password)
+    except ValueError as error:
+        text = str(error or "").strip()
+        if "Password is required" in text:
+            raise ValueError(_localize_legacy_import_message("password_required", language))
+        if "Password must be" in text:
+            raise ValueError(_localize_legacy_import_message("password_invalid", language))
+        if "Nickname" in text:
+            raise ValueError(_localize_legacy_import_message("identifier_required", language))
+        raise
+
+    try:
+        account = _extract_privilege_account_from_users_ini(
+            server_id=safe_server_id,
+            server_name=safe_server_name,
+            identifier_type=normalized_identifier_type,
+            nickname=safe_nickname,
+            steam_id=safe_steam_id,
+        )
+    except Exception as error:
+        print(f"[LEGACY IMPORT ERROR] lookup failed: {_redact_sensitive_text(error)}", file=sys.stderr)
+        raise ValueError(_localize_legacy_import_message("ftp_failed", language))
+
+    if not bool(account.get("supported")):
+        raise ValueError(_localize_legacy_import_message("unknown_server", language))
+    if not bool(account.get("exists")):
+        raise ValueError(_localize_legacy_import_message("account_not_found", language))
+    if bool(account.get("is_disabled")):
+        raise ValueError(_localize_legacy_import_message("account_disabled", language))
+    if bool(account.get("is_expired")):
+        raise ValueError(_localize_legacy_import_message("account_expired", language))
+
+    try:
+        verify_result = _verify_privilege_password_from_users_ini(
+            server_id=safe_server_id,
+            server_name=safe_server_name,
+            identifier_type=normalized_identifier_type,
+            nickname=safe_nickname,
+            steam_id=safe_steam_id,
+            password=safe_password,
+        )
+    except Exception as error:
+        print(f"[LEGACY IMPORT ERROR] verify failed: {_redact_sensitive_text(error)}", file=sys.stderr)
+        raise ValueError(_localize_legacy_import_message("ftp_failed", language))
+    if not bool(verify_result.get("exists")):
+        raise ValueError(_localize_legacy_import_message("account_not_found", language))
+    if not bool(verify_result.get("valid")):
+        raise ValueError(_localize_legacy_import_message("password_invalid", language))
+
+    account_privilege = str(account.get("privilege", "")).strip()
+    account_flags = str(account.get("flags", "")).strip()
+    privilege_key = _normalize_sale_privilege_key(account_privilege) or _normalize_privilege_key_from_flags(account_flags)
+    if not privilege_key:
+        raise ValueError(_localize_legacy_import_message("privilege_unsupported", language))
+    privilege_label = PRIVILEGE_LABELS_BY_KEY.get(privilege_key, account_privilege or privilege_key.upper())
+
+    is_permanent = bool(account.get("is_permanent"))
+    if is_permanent:
+        remaining_days = 1
+        total_days = 1
+        duration_months = 0
+        duration_label = "Doimiy" if str(language or "").strip().lower() == "uz" else "Навсегда"
+    else:
+        remaining_days = max(_safe_int(account.get("days", 0), 0), 0)
+        if remaining_days <= 0:
+            raise ValueError(_localize_legacy_import_message("account_expired", language))
+        total_days = _normalize_total_days_for_import(remaining_days)
+        duration_months = max((total_days + 29) // 30, 1)
+        duration_label = _build_duration_label(duration_months, language)
+
+    resolved_nickname = str(account.get("nickname", "")).strip() if normalized_identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME else ""
+    resolved_steam_id = normalize_steam_id(account.get("steam_id", "")) if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM else ""
+    if normalized_identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME and not resolved_nickname:
+        resolved_nickname = safe_nickname
+    if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM and not resolved_steam_id:
+        resolved_steam_id = safe_steam_id
+
+    owner = _find_active_privilege_owner(
+        server_id=safe_server_id,
+        server_name=safe_server_name,
+        identifier_type=normalized_identifier_type,
+        nickname=resolved_nickname,
+        steam_id=resolved_steam_id,
+    )
+    if owner and int(owner.get("user_id", 0) or 0) > 0 and int(owner.get("user_id", 0) or 0) != safe_user_id:
+        raise PermissionError(_localize_legacy_import_message("already_linked_other", language))
+
+    if owner and int(owner.get("user_id", 0) or 0) == safe_user_id:
+        existing_snapshot = _find_user_privilege_snapshot_by_binding(
+            user_id=safe_user_id,
+            server_id=safe_server_id,
+            server_name=safe_server_name,
+            identifier_type=normalized_identifier_type,
+            nickname=resolved_nickname,
+            steam_id=resolved_steam_id,
+        )
+        return {
+            "already_imported": True,
+            "record": None,
+            "snapshot": existing_snapshot,
+            "remaining_days": int(owner.get("remaining_days", 0) or 0),
+            "total_days": int(owner.get("total_days", 0) or 0),
+            "privilege": privilege_label,
+            "identifier_type": normalized_identifier_type,
+            "nickname": resolved_nickname,
+            "steam_id": resolved_steam_id,
+            "password": safe_password,
+            "server_id": safe_server_id,
+            "server_name": safe_server_name,
+            "is_permanent": bool(owner.get("is_permanent")),
+        }
+
+    current_balance = int(get_user_balance(safe_user_id))
+    purchase_record = create_purchase_record(
+        user_id=safe_user_id,
+        username=username,
+        first_name=first_name,
+        last_name=last_name,
+        server_id=safe_server_id,
+        privilege=privilege_label,
+        server_name=safe_server_name,
+        duration=duration_label,
+        duration_months=duration_months,
+        nickname=resolved_nickname,
+        password="",
+        language=language,
+        amount=0,
+        product_type=PRODUCT_TYPE_LEGACY_IMPORT,
+        identifier_type=normalized_identifier_type,
+        steam_id=resolved_steam_id,
+        source=PRODUCT_TYPE_LEGACY_IMPORT,
+        renew_password=safe_password,
+    )
+    purchase_record["issued_mode"] = PRODUCT_TYPE_LEGACY_IMPORT
+    purchase_record["issued_before_days"] = int(0 if is_permanent else remaining_days)
+    purchase_record["issued_after_days"] = int(0 if is_permanent else remaining_days)
+    purchase_record["issued_privilege"] = privilege_label
+    purchase_record["issued_flags"] = account_flags
+    purchase_record["issued_was_disabled"] = False
+    purchase_record["issued_password_changed"] = False
+    purchase_record["issued_calculated_amount"] = 0
+    purchase_record["issued_credit_amount"] = 0
+    purchase_record["issued_previous_privilege"] = privilege_label
+    purchase_record["issued_target_privilege"] = privilege_label
+    purchase_record["issued_identifier_type"] = normalized_identifier_type
+    purchase_record["issued_identifier_value"] = resolved_steam_id if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM else resolved_nickname
+    purchase_record["user_balance_after"] = int(current_balance)
+    purchase_record["payment_source"] = PRODUCT_TYPE_LEGACY_IMPORT
+    purchase_record["imported_remaining_days"] = int(0 if is_permanent else remaining_days)
+    purchase_record["imported_total_days"] = int(0 if is_permanent else total_days)
+    purchase_record["imported_is_permanent"] = bool(is_permanent)
+    purchase_record["is_permanent"] = bool(is_permanent)
+
+    save_purchase_record(purchase_record)
+    append_user_balance_transaction(
+        user_id=safe_user_id,
+        transaction_type=PRODUCT_TYPE_LEGACY_IMPORT,
+        delta=0,
+        before=current_balance,
+        after=current_balance,
+        metadata={
+            "source": PRODUCT_TYPE_LEGACY_IMPORT,
+            "server_id": safe_server_id,
+            "server_name": safe_server_name,
+            "privilege": privilege_label,
+            "duration_months": int(duration_months),
+            "identifier_type": normalized_identifier_type,
+            "nickname": resolved_nickname,
+            "steam_id": resolved_steam_id,
+            "remaining_days": int(remaining_days),
+            "total_days": int(total_days),
+            "is_permanent": bool(is_permanent),
+        },
+    )
+    return {
+        "already_imported": False,
+        "record": purchase_record,
+        "snapshot": None,
+        "remaining_days": int(remaining_days),
+        "total_days": int(total_days),
+        "is_permanent": bool(is_permanent),
+        "privilege": privilege_label,
+        "identifier_type": normalized_identifier_type,
+        "nickname": resolved_nickname,
+        "steam_id": resolved_steam_id,
+        "password": safe_password,
+        "server_id": safe_server_id,
+        "server_name": safe_server_name,
     }
 
 
@@ -2042,8 +4635,11 @@ def create_purchase_record(
     bonus_added=0,
     bonus_before=0,
     bonus_after=0,
+    source="purchase",
+    renew_password="",
 ):
     safe_password = str(password or "").strip()
+    safe_renew_password = str(renew_password or "").strip()
     return {
         "id": uuid.uuid4().hex[:14],
         "created_at": int(time.time()),
@@ -2068,6 +4664,9 @@ def create_purchase_record(
         "bonus_added": int(bonus_added or 0),
         "bonus_before": int(bonus_before or 0),
         "bonus_after": int(bonus_after or 0),
+        "source": str(source or "purchase").strip().lower() or "purchase",
+        "renew_password_set": bool(safe_renew_password),
+        "renew_password": safe_renew_password if safe_renew_password else "",
         "report_message_id": None,
     }
 
@@ -2113,6 +4712,8 @@ def get_active_purchases_between(start_dt_local, end_dt_local):
             dict(purchase)
             for purchase in REPORTS_STORE["purchases"]
             if purchase.get("status") == "active"
+            and str(purchase.get("product_type", PRODUCT_TYPE_PRIVILEGE)).strip().lower()
+            in {PRODUCT_TYPE_PRIVILEGE, PRODUCT_TYPE_BONUS}
             and start_ts <= int(purchase.get("created_at", 0)) < end_ts
         ]
 
@@ -2505,8 +5106,28 @@ def localize_payment_reason(reason, language="ru"):
             "To'lov allaqachon boshqa xaridga biriktirilgan va qayta ishlatilmaydi",
         ),
         (
-            "нет данных для сравнения баланса @HUMOcardbot",
-            "@HUMOcardbot balansini solishtirish uchun ma'lumot topilmadi",
+            "нет данных для сравнения баланса @CardXabarBot",
+            "@CardXabarBot balansini solishtirish uchun ma'lumot topilmadi",
+        ),
+        (
+            "Пополнение не найдено в @CardXabarBot",
+            "To'ldirish @CardXabarBot ichida topilmadi",
+        ),
+        (
+            "Требуется ручная проверка",
+            "Qo'lda tekshiruv talab qilinadi",
+        ),
+        (
+            "Платёж отправлен на ручную проверку.",
+            "To'lov qo'lda tekshiruvga yuborildi.",
+        ),
+        (
+            "Не удалось получить стартовый баланс карты",
+            "Karta boshlang'ich balansini olib bo'lmadi",
+        ),
+        (
+            "Не удалось подготовить сессию проверки",
+            "Tekshiruv sessiyasini tayyorlab bo'lmadi",
         ),
         ("баланс карты не изменился", "karta balansi o'zgarmadi"),
         ("разница баланса (", "balans farqi ("),
@@ -2537,6 +5158,57 @@ def localize_payment_reason(reason, language="ru"):
     return translated
 
 
+def user_friendly_payment_reason(reason, language="ru"):
+    raw_text = str(reason or "").strip()
+    normalized_language = str(language or "ru").strip().lower()
+    lowered = raw_text.casefold()
+    localized = localize_payment_reason(raw_text, normalized_language)
+
+    detailed_receipt_ru = (
+        "Не удалось подтвердить оплату по этому скриншоту. Откройте подробности операции "
+        "(раскрытый чек), чтобы были видны получатель, карта ***1316, дата/время и сумма, "
+        "затем отправьте скриншот ещё раз."
+    )
+    detailed_receipt_uz = (
+        "Bu skrinshot bo'yicha to'lovni tasdiqlab bo'lmadi. Operatsiya tafsilotlarini oching "
+        "(kengaytirilgan chek): qabul qiluvchi, karta ***1316, sana/vaqt va summa ko'rinsin, "
+        "so'ng skrinshotni qayta yuboring."
+    )
+    amount_retry_ru = "Проверьте сумму перевода на скриншоте и отправьте скриншот ещё раз."
+    amount_retry_uz = "Skrinshotdagi o'tkazma summasini tekshirib, skrinshotni qayta yuboring."
+
+    if any(
+        token in lowered
+        for token in (
+            "manual_review",
+            "ручн",
+            "qo'lda",
+            "@cardxabarbot",
+            "оплата не найдена",
+            "пополнение не найдено",
+            "баланс карты не изменился",
+            "разница баланса",
+        )
+    ):
+        return detailed_receipt_uz if normalized_language == "uz" else detailed_receipt_ru
+
+    if (
+        "получатель на скриншоте" in lowered
+        or "qabul qiluvchi" in lowered
+        or "получатель" in lowered
+    ):
+        return detailed_receipt_uz if normalized_language == "uz" else detailed_receipt_ru
+
+    if (
+        "не удалось определить сумму перевода" in lowered
+        or "сумма на скриншоте" in lowered
+        or "summasini aniqlab bo'lmadi" in lowered
+    ):
+        return amount_retry_uz if normalized_language == "uz" else amount_retry_ru
+
+    return localized
+
+
 def is_technical_payment_verification_error(reason):
     text = str(reason or "").strip().lower()
     return (
@@ -2549,7 +5221,7 @@ def is_technical_payment_verification_error(reason):
 
 def format_payment_ban_reason(*, reason, seconds_remaining, language="ru"):
     normalized_language = str(language or "ru").strip().lower()
-    localized_reason = localize_payment_reason(reason, normalized_language)
+    localized_reason = user_friendly_payment_reason(reason, normalized_language)
     base_reason = str(localized_reason or "").strip() or (
         "Noto'g'ri skrinshotlar juda ko'p yuborildi"
         if normalized_language == "uz"
@@ -2560,11 +5232,13 @@ def format_payment_ban_reason(*, reason, seconds_remaining, language="ru"):
     if normalized_language == "uz":
         return (
             f"To'lov tekshiruvi vaqtincha bloklangan: {base_reason}. "
-            f"Qayta urinish vaqti taxminan {minutes} daqiqa."
+            f"Qayta urinish vaqti taxminan {minutes} daqiqa. "
+            f"Agar pul yechilgan bo'lib, hisobga tushmagan bo'lsa, {PAYMENT_SUPPORT_CONTACT} ga yozing."
         )
     return (
         f"Проверка оплаты временно заблокирована: {base_reason}. "
-        f"Повторить можно примерно через {minutes} минут."
+        f"Повторить можно примерно через {minutes} минут. "
+        f"Если деньги списались, но не зачислились, напишите {PAYMENT_SUPPORT_CONTACT}."
     )
 
 
@@ -2944,6 +5618,7 @@ def main_inline_keyboard():
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="menu_command")
     await update.message.reply_text(
         "🎮 <b>Strike.Uz меню</b>",
         reply_markup=main_inline_keyboard(),
@@ -2952,6 +5627,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="miniapp_command")
     _url = get_web_app_url()
     if not _url:
         await update.message.reply_text(
@@ -3017,6 +5693,7 @@ def number_to_emoji(n: int) -> str:
 
 
 async def players_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="players_server_callback")
     query = update.callback_query
     await query.answer()
 
@@ -3051,6 +5728,7 @@ async def players_server_callback(update: Update, context: ContextTypes.DEFAULT_
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="start_command")
     if update.message.chat.type == "private":
         await ensure_chat_menu_button_for_chat(context.bot, update.message.chat.id)
         await update.message.reply_text(
@@ -3071,18 +5749,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="info_command")
     await update.message.reply_text(
         INFO_TEXT,
         parse_mode="HTML"
     )
 
 async def vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="vip_command")
     await update.message.reply_text(
         VIP_TEXT,
         parse_mode="HTML"
     )
 
 async def server(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="server_command")
     response_message = update.effective_message
     servers = await get_servers()
 
@@ -3106,10 +5787,12 @@ async def server(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await response_message.reply_text(text, parse_mode="HTML")
 
 async def players_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="players_button")
     await players(update, context)
 
 
 async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="players_command")
     response_message = update.effective_message
     keyboard = []
 
@@ -3131,6 +5814,7 @@ async def players(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def players_category_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="players_category_callback")
     query = update.callback_query
     await query.answer()
 
@@ -3165,6 +5849,7 @@ async def players_category_callback(update: Update, context: ContextTypes.DEFAUL
 
 
 async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="menu_callback")
     query = update.callback_query
 
     if query.data == "menu_players":
@@ -3440,6 +6125,214 @@ def send_bonus_confirmation_message(
         return False
 
 
+def send_welcome_bonus_confirmation_message(
+    *,
+    user_id: int,
+    amount_added: int,
+    balance_before: int,
+    balance_after: int,
+    language: str = "ru",
+) -> bool:
+    if not TOKEN:
+        return False
+
+    safe_amount_added = format_money_uzs(amount_added)
+    safe_before = format_money_uzs(balance_before)
+    safe_after = format_money_uzs(balance_after)
+    normalized_language = str(language or "ru").strip().lower()
+
+    if normalized_language == "uz":
+        text = (
+            "🎁 <b>Tabriklaymiz! Start bonusi olindi ✅</b>\n"
+            f"➕ <b>Qo'shildi:</b> {safe_amount_added} UZS\n"
+            f"📊 <b>Oldin:</b> {safe_before} UZS\n"
+            f"💰 <b>Hozir:</b> {safe_after} UZS\n\n"
+            "🛍 Ushbu mablag'ni imtiyozlar xaridida ishlatishingiz mumkin."
+        )
+    else:
+        text = (
+            "🎁 <b>Поздравляем! Стартовый бонус получен ✅</b>\n"
+            f"➕ <b>Зачислено:</b> {safe_amount_added} UZS\n"
+            f"📊 <b>Было:</b> {safe_before} UZS\n"
+            f"💰 <b>Стало:</b> {safe_after} UZS\n\n"
+            "🛍 Эту сумму можно использовать при покупке привилегий."
+        )
+
+    try:
+        response_payload = telegram_send_message(user_id, text)
+        return bool(response_payload.get("ok"))
+    except Exception as error:
+        print(f"[WELCOME BONUS NOTIFY ERROR] {_redact_sensitive_text(error)}", file=sys.stderr)
+        return False
+
+
+def send_welcome_bonus_report_to_group(
+    *,
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+    amount_added: int,
+    balance_before: int,
+    balance_after: int,
+):
+    reports_chat_id = get_reports_chat_id()
+    if reports_chat_id is None:
+        return False
+
+    mention = build_user_mention(
+        user_id=int(user_id),
+        username=str(username or "").strip(),
+        first_name=str(first_name or "").strip(),
+        last_name=str(last_name or "").strip(),
+    )
+    safe_amount_added = format_money_uzs(amount_added)
+    safe_before = format_money_uzs(balance_before)
+    safe_after = format_money_uzs(balance_after)
+    text = (
+        "🎁 <b>Получен стартовый бонус</b>\n"
+        f"👤 <b>Пользователь:</b> {mention}\n"
+        f"➕ <b>Зачислено:</b> {safe_amount_added} UZS\n"
+        f"📊 <b>Было:</b> {safe_before} UZS\n"
+        f"💰 <b>Стало:</b> {safe_after} UZS\n"
+        "#welcome_bonus_report"
+    )
+
+    try:
+        response_payload = telegram_send_message(reports_chat_id, text)
+        return bool(response_payload.get("ok"))
+    except Exception as error:
+        print(f"[REPORTS ERROR] Failed to send welcome bonus report: {_redact_sensitive_text(error)}", file=sys.stderr)
+        return False
+
+
+def send_legacy_import_confirmation_message(
+    *,
+    user_id: int,
+    privilege: str,
+    server_name: str,
+    identifier_type: str,
+    nickname: str = "",
+    steam_id: str = "",
+    remaining_days: int = 0,
+    total_days: int = 30,
+    is_permanent: bool = False,
+    language: str = "ru",
+) -> bool:
+    if not TOKEN:
+        return False
+
+    safe_privilege = html.escape(str(privilege or "").strip() or "-")
+    safe_server = html.escape(str(server_name or "").strip() or "-")
+    safe_nickname = html.escape(str(nickname or "").strip() or "-")
+    safe_steam_id = html.escape(normalize_steam_id(steam_id))
+    safe_remaining = max(int(remaining_days or 0), 0)
+    safe_total = max(int(total_days or 0), 1)
+    safe_is_permanent = bool(is_permanent)
+    normalized_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    normalized_language = str(language or "ru").strip().lower()
+
+    identifier_line = (
+        f"🆔 <b>STEAM_ID:</b> <code>{safe_steam_id}</code>"
+        if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM
+        else f"👤 <b>Nick:</b> {safe_nickname}"
+    )
+    if normalized_language == "uz":
+        duration_line = (
+            "⏳ <b>Muddat:</b> Doimiy"
+            if safe_is_permanent
+            else f"⏳ <b>Qolgan muddat:</b> {safe_remaining}/{safe_total}"
+        )
+        text = (
+            "🧩 <b>Mavjud imtiyoz profilingizga qo'shildi ✅</b>\n"
+            f"🛡 <b>Imtiyoz:</b> {safe_privilege}\n"
+            f"🎮 <b>Server:</b> {safe_server}\n"
+            f"{identifier_line}\n"
+            f"{duration_line}"
+        )
+    else:
+        duration_line = (
+            "⏳ <b>Срок:</b> Постоянная"
+            if safe_is_permanent
+            else f"⏳ <b>Остаток:</b> {safe_remaining}/{safe_total}"
+        )
+        text = (
+            "🧩 <b>Существующая привилегия успешно добавлена в профиль ✅</b>\n"
+            f"🛡 <b>Привилегия:</b> {safe_privilege}\n"
+            f"🎮 <b>Сервер:</b> {safe_server}\n"
+            f"{identifier_line}\n"
+            f"{duration_line}"
+        )
+
+    try:
+        response_payload = telegram_send_message(user_id, text)
+        return bool(response_payload.get("ok"))
+    except Exception as error:
+        print(f"[LEGACY IMPORT NOTIFY ERROR] {_redact_sensitive_text(error)}", file=sys.stderr)
+        return False
+
+
+def send_legacy_import_report_to_group(
+    *,
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+    privilege: str,
+    server_name: str,
+    identifier_type: str,
+    nickname: str = "",
+    steam_id: str = "",
+    remaining_days: int = 0,
+    total_days: int = 30,
+    is_permanent: bool = False,
+) -> bool:
+    reports_chat_id = get_reports_chat_id()
+    if reports_chat_id is None:
+        return False
+
+    mention = build_user_mention(
+        user_id=int(user_id),
+        username=str(username or "").strip(),
+        first_name=str(first_name or "").strip(),
+        last_name=str(last_name or "").strip(),
+    )
+    safe_privilege = html.escape(str(privilege or "").strip() or "-")
+    safe_server = html.escape(str(server_name or "").strip() or "-")
+    safe_nickname = html.escape(str(nickname or "").strip() or "-")
+    safe_steam_id = html.escape(normalize_steam_id(steam_id))
+    safe_remaining = max(int(remaining_days or 0), 0)
+    safe_total = max(int(total_days or 0), 1)
+    safe_is_permanent = bool(is_permanent)
+    normalized_identifier_type = normalize_privilege_identifier_type(identifier_type)
+    identifier_line = (
+        f"🆔 <b>STEAM_ID:</b> <code>{safe_steam_id}</code>"
+        if normalized_identifier_type == PRIVILEGE_IDENTIFIER_STEAM
+        else f"🕹 <b>Nick:</b> {safe_nickname}"
+    )
+    duration_line = (
+        "⏳ <b>Срок:</b> Постоянная"
+        if safe_is_permanent
+        else f"⏳ <b>Остаток:</b> {safe_remaining}/{safe_total}"
+    )
+    text = (
+        "🧾 <b>Legacy import привилегии</b>\n"
+        f"👤 <b>Username:</b> {mention}\n"
+        f"🛡 <b>Привилегия:</b> {safe_privilege}\n"
+        f"🎮 <b>Сервер:</b> {safe_server}\n"
+        f"{identifier_line}\n"
+        f"{duration_line}\n"
+        "#legacy_import_report"
+    )
+
+    try:
+        response_payload = telegram_send_message(reports_chat_id, text)
+        return bool(response_payload.get("ok"))
+    except Exception as error:
+        print(f"[REPORTS ERROR] Failed to send legacy import report: {_redact_sensitive_text(error)}", file=sys.stderr)
+        return False
+
+
 def send_balance_topup_confirmation_message(
     *,
     user_id: int,
@@ -3546,6 +6439,61 @@ def send_balance_topup_report_to_group(
         return False, None
 
 
+def send_admin_balance_adjust_report_to_group(
+    *,
+    user_id: int,
+    username: str = "",
+    first_name: str = "",
+    last_name: str = "",
+    amount_delta: int = 0,
+    balance_before: int = 0,
+    balance_after: int = 0,
+    comment: str = "",
+    admin_label: str = "",
+):
+    reports_chat_id = get_reports_chat_id()
+    if reports_chat_id is None:
+        return False
+
+    mention = build_user_mention(
+        user_id=int(user_id),
+        username=str(username or "").strip(),
+        first_name=str(first_name or "").strip(),
+        last_name=str(last_name or "").strip(),
+    )
+    safe_delta = format_money_uzs(abs(int(amount_delta or 0)))
+    safe_before = format_money_uzs(balance_before)
+    safe_after = format_money_uzs(balance_after)
+    safe_admin_label = html.escape(str(admin_label or "admin"))
+    safe_comment = html.escape(str(comment or "").strip())
+    operation_line = (
+        f"➕ <b>Изменение:</b> +{safe_delta} UZS"
+        if int(amount_delta or 0) >= 0
+        else f"➖ <b>Изменение:</b> -{safe_delta} UZS"
+    )
+
+    text = (
+        "🛠 <b>Ручная корректировка баланса</b>\n"
+        f"👤 <b>Пользователь:</b> {mention}\n"
+        f"{operation_line}\n"
+        f"📊 <b>Было:</b> {safe_before} UZS\n"
+        f"💰 <b>Стало:</b> {safe_after} UZS\n"
+        f"🧾 <b>Комментарий:</b> {safe_comment or '-'}\n"
+        f"🧑‍💼 <b>Админ:</b> {safe_admin_label}\n"
+        "#admin_balance_adjust"
+    )
+
+    try:
+        response_payload = telegram_send_message(reports_chat_id, text)
+        return bool(response_payload.get("ok"))
+    except Exception as error:
+        print(
+            f"[REPORTS ERROR] Failed to send admin balance adjustment report: {_redact_sensitive_text(error)}",
+            file=sys.stderr,
+        )
+        return False
+
+
 def send_payment_verification_failed_message(
     user_id: int,
     *,
@@ -3560,7 +6508,7 @@ def send_payment_verification_failed_message(
         return False
 
     normalized_language = str(language or "ru").strip().lower()
-    localized_reason = localize_payment_reason(reason, normalized_language)
+    localized_reason = user_friendly_payment_reason(reason, normalized_language)
     safe_reason = html.escape(str(localized_reason or "").strip())
     remaining = max(int(remaining_attempts or 0), 0)
     maximum = max(int(max_attempts or 1), 1)
@@ -3588,14 +6536,16 @@ def send_payment_verification_failed_message(
                 "⛔ <b>To'lov tekshiruvi vaqtincha bloklandi.</b>\n"
                 f"Sabab: {safe_reason}\n"
                 f"Juda ko'p noto'g'ri skrinshot yuborildi. "
-                f"Qayta urinish vaqti: taxminan <b>{ban_minutes} daqiqa</b>."
+                f"Qayta urinish vaqti: taxminan <b>{ban_minutes} daqiqa</b>.\n"
+                f"Agar pul yechilgan bo'lib, hisobga tushmagan bo'lsa, {html.escape(PAYMENT_SUPPORT_CONTACT)} ga yozing."
             )
         else:
             text = (
                 "⛔ <b>Проверка оплаты временно заблокирована.</b>\n"
                 f"Причина: {safe_reason}\n"
                 f"Отправлено слишком много неверных скриншотов. "
-                f"Повторить можно примерно через <b>{ban_minutes} минут</b>."
+                f"Повторить можно примерно через <b>{ban_minutes} минут</b>.\n"
+                f"Если деньги списались, но не зачислились, напишите {html.escape(PAYMENT_SUPPORT_CONTACT)}."
             )
     elif remaining > 0:
         if normalized_language == "uz":
@@ -4162,6 +7112,7 @@ async def cancel_purchase_confirm_callback(update: Update, context: ContextTypes
 
 
 async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    touch_user_activity_from_update(update, source="web_app_data")
     message = update.effective_message
     if not message or not message.web_app_data:
         return
@@ -4213,6 +7164,23 @@ async def web_app_data_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 class MiniAppAPIHandler(BaseHTTPRequestHandler):
+    def _get_admin_key_header(self):
+        return str(self.headers.get("X-Admin-Key", "")).strip()
+
+    def _is_admin_authorized(self):
+        if not ADMIN_DASHBOARD_KEY:
+            return True
+        provided = self._get_admin_key_header()
+        if not provided:
+            return False
+        return hmac.compare_digest(provided, ADMIN_DASHBOARD_KEY)
+
+    def _require_admin_authorization(self):
+        if self._is_admin_authorized():
+            return True
+        self._send_json(403, {"error": "Admin access denied"})
+        return False
+
     def _send_json(self, status_code, payload):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
@@ -4220,7 +7188,10 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, bypass-tunnel-reminder")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Accept, bypass-tunnel-reminder, X-Admin-Key",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -4228,7 +7199,10 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, bypass-tunnel-reminder")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Content-Type, Accept, bypass-tunnel-reminder, X-Admin-Key",
+        )
         self.end_headers()
 
     def do_POST(self):
@@ -4244,6 +7218,367 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             payload = json.loads(raw_body.decode("utf-8"))
         except Exception:
             self._send_json(400, {"error": "Invalid JSON payload"})
+            return
+
+        if path == "/api/admin/broadcasts/preview":
+            if not self._require_admin_authorization():
+                return
+            try:
+                preview = create_admin_broadcast_preview(payload)
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "preview": preview,
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/admin/broadcasts/create":
+            if not self._require_admin_authorization():
+                return
+
+            preview_token = str(payload.get("previewToken", "")).strip()
+            confirm_phrase = str(payload.get("confirmPhrase", "")).strip()
+            confirm_send_raw = payload.get("confirmSend", False)
+            if isinstance(confirm_send_raw, bool):
+                confirm_send = bool(confirm_send_raw)
+            else:
+                confirm_send = str(confirm_send_raw).strip().lower() in {"1", "true", "yes", "on"}
+
+            try:
+                campaign = _create_broadcast_campaign_from_preview(
+                    preview_token,
+                    confirm_send=confirm_send,
+                    confirm_phrase=confirm_phrase,
+                )
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "campaign": campaign,
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/admin/balance-adjust":
+            if not self._require_admin_authorization():
+                return
+
+            try:
+                user_id = int(payload.get("userId", 0))
+            except (TypeError, ValueError):
+                user_id = 0
+            try:
+                amount_delta = int(payload.get("amount", 0))
+            except (TypeError, ValueError):
+                amount_delta = 0
+
+            comment = str(payload.get("comment", "")).strip()
+            admin_label = str(payload.get("adminLabel", "")).strip()
+            username = str(payload.get("username", "")).strip().lstrip("@")
+            first_name = str(payload.get("firstName", "")).strip()
+            last_name = str(payload.get("lastName", "")).strip()
+
+            if user_id <= 0:
+                self._send_json(400, {"error": "userId is required"})
+                return
+            if amount_delta == 0:
+                self._send_json(400, {"error": "amount must not be 0"})
+                return
+            if len(comment) < 3:
+                self._send_json(400, {"error": "comment must be at least 3 characters"})
+                return
+            if len(comment) > 300:
+                self._send_json(400, {"error": "comment is too long"})
+                return
+
+            tx_type = "admin_credit" if amount_delta > 0 else "admin_debit"
+            try:
+                balance_before, balance_after = adjust_user_balance(
+                    user_id,
+                    amount_delta,
+                    transaction_type=tx_type,
+                    metadata={
+                        "comment": comment,
+                        "admin_label": admin_label or "admin_dashboard",
+                        "source": "admin_dashboard",
+                    },
+                )
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="admin_balance_adjust",
+            )
+            report_sent = send_admin_balance_adjust_report_to_group(
+                user_id=user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                amount_delta=amount_delta,
+                balance_before=balance_before,
+                balance_after=balance_after,
+                comment=comment,
+                admin_label=admin_label or "admin_dashboard",
+            )
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "userId": int(user_id),
+                    "amount": int(amount_delta),
+                    "balanceBefore": int(balance_before),
+                    "balanceAfter": int(balance_after),
+                    "comment": comment,
+                    "reportSent": bool(report_sent),
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/welcome-bonus-claim":
+            try:
+                user_id = int(payload.get("userId", 0))
+            except (TypeError, ValueError):
+                user_id = 0
+            username = str(payload.get("username", "")).strip().lstrip("@")
+            first_name = str(payload.get("firstName", "")).strip()
+            last_name = str(payload.get("lastName", "")).strip()
+            request_id = str(payload.get("requestId", "")).strip()
+            language = str(payload.get("language", "ru")).strip().lower()
+            if language not in {"ru", "uz"}:
+                language = "ru"
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="api_welcome_bonus_claim",
+                language=language,
+            )
+
+            if user_id <= 0:
+                self._send_json(400, {"error": "userId is required"})
+                return
+            if WELCOME_BONUS_AMOUNT <= 0:
+                self._send_json(400, {"error": "Welcome bonus is disabled"})
+                return
+
+            try:
+                claim_result = claim_welcome_bonus_once(
+                    user_id,
+                    amount=WELCOME_BONUS_AMOUNT,
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    request_id=request_id,
+                )
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+
+            claim_info = claim_result.get("claim", {}) if isinstance(claim_result, dict) else {}
+            claimed_now = bool(claim_result.get("claimed_now")) if isinstance(claim_result, dict) else False
+            balance_before = _safe_int(claim_result.get("balance_before", 0), 0)
+            balance_after = _safe_int(claim_result.get("balance_after", 0), 0)
+            notification_sent = False
+            report_sent = False
+
+            if claimed_now:
+                notification_sent = send_welcome_bonus_confirmation_message(
+                    user_id=int(user_id),
+                    amount_added=WELCOME_BONUS_AMOUNT,
+                    balance_before=balance_before,
+                    balance_after=balance_after,
+                    language=language,
+                )
+                report_sent = send_welcome_bonus_report_to_group(
+                    user_id=int(user_id),
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    amount_added=WELCOME_BONUS_AMOUNT,
+                    balance_before=balance_before,
+                    balance_after=balance_after,
+                )
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "claimed": bool(claimed_now),
+                    "alreadyClaimed": not bool(claimed_now),
+                    "bonusAmount": int(WELCOME_BONUS_AMOUNT),
+                    "claim": {
+                        "claimedAt": int(_safe_int(claim_info.get("claimed_at", 0), 0)),
+                        "amount": int(max(_safe_int(claim_info.get("amount", 0), 0), 0)),
+                    },
+                    "balanceBefore": int(balance_before),
+                    "balanceAfter": int(balance_after),
+                    "notificationSent": bool(notification_sent),
+                    "reportSent": bool(report_sent),
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/legacy-privilege-import":
+            try:
+                user_id = int(payload.get("userId", 0))
+            except (TypeError, ValueError):
+                user_id = 0
+            username = str(payload.get("username", "")).strip().lstrip("@")
+            first_name = str(payload.get("firstName", "")).strip()
+            last_name = str(payload.get("lastName", "")).strip()
+            server_id = str(payload.get("serverId", "")).strip()
+            server_name = str(payload.get("serverName", "")).strip()
+            identifier_type = normalize_privilege_identifier_type(payload.get("identifierType", "nickname"))
+            nickname = str(payload.get("nickname", "")).strip()
+            steam_id = normalize_steam_id(payload.get("steamId", ""))
+            password = str(payload.get("password", "")).strip()
+            language = str(payload.get("language", "ru")).strip().lower()
+            if language not in {"ru", "uz"}:
+                language = "ru"
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="api_legacy_import",
+                language=language,
+            )
+
+            try:
+                import_result = import_legacy_privilege_binding(
+                    user_id=user_id,
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    server_id=server_id,
+                    server_name=server_name,
+                    identifier_type=identifier_type,
+                    nickname=nickname,
+                    steam_id=steam_id,
+                    password=password,
+                    language=language,
+                )
+            except PermissionError as error:
+                self._send_json(409, {"error": str(error)})
+                return
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+                return
+            except Exception as error:
+                print(f"[LEGACY IMPORT ERROR] {_redact_sensitive_text(error)}", file=sys.stderr)
+                self._send_json(
+                    502,
+                    {"error": _localize_legacy_import_message("ftp_failed", language)},
+                )
+                return
+
+            already_imported = bool(import_result.get("already_imported"))
+            snapshot = import_result.get("snapshot")
+            if not snapshot:
+                snapshot = _find_user_privilege_snapshot_by_binding(
+                    user_id=user_id,
+                    server_id=server_id,
+                    server_name=server_name,
+                    identifier_type=identifier_type,
+                    nickname=str(import_result.get("nickname", "")),
+                    steam_id=str(import_result.get("steam_id", "")),
+                )
+
+            notification_sent = False
+            report_sent = False
+            if not already_imported:
+                notification_sent = send_legacy_import_confirmation_message(
+                    user_id=int(user_id),
+                    privilege=str(import_result.get("privilege", "")),
+                    server_name=str(import_result.get("server_name", "")),
+                    identifier_type=str(import_result.get("identifier_type", identifier_type)),
+                    nickname=str(import_result.get("nickname", "")),
+                    steam_id=str(import_result.get("steam_id", "")),
+                    remaining_days=int(import_result.get("remaining_days", 0) or 0),
+                    total_days=int(import_result.get("total_days", 0) or 0),
+                    is_permanent=bool(import_result.get("is_permanent")),
+                    language=language,
+                )
+                report_sent = send_legacy_import_report_to_group(
+                    user_id=int(user_id),
+                    username=username,
+                    first_name=first_name,
+                    last_name=last_name,
+                    privilege=str(import_result.get("privilege", "")),
+                    server_name=str(import_result.get("server_name", "")),
+                    identifier_type=str(import_result.get("identifier_type", identifier_type)),
+                    nickname=str(import_result.get("nickname", "")),
+                    steam_id=str(import_result.get("steam_id", "")),
+                    remaining_days=int(import_result.get("remaining_days", 0) or 0),
+                    total_days=int(import_result.get("total_days", 0) or 0),
+                    is_permanent=bool(import_result.get("is_permanent")),
+                )
+
+            snapshot_payload = None
+            if isinstance(snapshot, dict):
+                snapshot_payload = {
+                    "id": str(snapshot.get("id", "")).strip(),
+                    "createdAt": int(snapshot.get("created_at", 0) or 0),
+                    "serverId": str(snapshot.get("server_id", "")).strip(),
+                    "serverName": str(snapshot.get("server_name", "")).strip(),
+                    "privilegeKey": str(snapshot.get("privilege_key", "")).strip(),
+                    "privilegeLabel": str(snapshot.get("privilege_label", "")).strip(),
+                    "identifierType": str(snapshot.get("identifier_type", PRIVILEGE_IDENTIFIER_NICKNAME)),
+                    "nickname": str(snapshot.get("nickname", "")).strip(),
+                    "steamId": str(snapshot.get("steam_id", "")).strip(),
+                    "remainingDays": int(snapshot.get("remaining_days", 0) or 0),
+                    "totalDays": int(snapshot.get("total_days", 0) or 0),
+                    "daysPassed": int(snapshot.get("days_passed", 0) or 0),
+                    "canRenew": bool(snapshot.get("can_renew")),
+                    "source": str(snapshot.get("source", "")).strip().lower(),
+                    "password": str(snapshot.get("password", "")).strip(),
+                    "isPermanent": bool(snapshot.get("is_permanent")),
+                }
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "alreadyImported": already_imported,
+                    "notificationSent": bool(notification_sent),
+                    "reportSent": bool(report_sent),
+                    "imported": {
+                        "serverId": str(import_result.get("server_id", server_id)).strip(),
+                        "serverName": str(import_result.get("server_name", server_name)).strip(),
+                        "privilege": str(import_result.get("privilege", "")).strip(),
+                        "identifierType": str(import_result.get("identifier_type", identifier_type)),
+                        "nickname": str(import_result.get("nickname", "")).strip(),
+                        "steamId": str(import_result.get("steam_id", "")).strip(),
+                        "remainingDays": int(import_result.get("remaining_days", 0) or 0),
+                        "totalDays": int(import_result.get("total_days", 0) or 0),
+                        "isPermanent": bool(import_result.get("is_permanent")),
+                    },
+                    "privilegeItem": snapshot_payload,
+                    "timestamp": int(time.time()),
+                },
+            )
             return
 
         if path == "/api/privilege-password-verify":
@@ -4266,7 +7601,9 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 result = _verify_privilege_password_from_users_ini(
                     server_id=server_id,
                     server_name=server_name,
+                    identifier_type=identifier_type,
                     nickname=nickname,
+                    steam_id="",
                     password=password,
                 )
             except ValueError as error:
@@ -4300,6 +7637,107 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/balance-topup-session-start":
+            try:
+                user_id = int(payload.get("userId", 0))
+            except (TypeError, ValueError):
+                user_id = 0
+            username = str(payload.get("username", "")).strip().lstrip("@")
+            first_name = str(payload.get("firstName", "")).strip()
+            last_name = str(payload.get("lastName", "")).strip()
+            language = str(payload.get("language", "ru")).strip().lower()
+            if language not in {"ru", "uz"}:
+                language = "ru"
+
+            topup_session_id = str(payload.get("topupSessionId", "")).strip()
+            try:
+                topup_session_started_at = int(payload.get("topupSessionStartedAt", 0))
+            except (TypeError, ValueError):
+                topup_session_started_at = 0
+            try:
+                topup_session_expires_at = int(payload.get("topupSessionExpiresAt", 0))
+            except (TypeError, ValueError):
+                topup_session_expires_at = 0
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="api_balance_topup_session_start",
+                language=language,
+            )
+
+            if user_id <= 0 or not topup_session_id:
+                self._send_json(400, {"error": "Missing required fields"})
+                return
+
+            if (
+                topup_session_started_at <= 0
+                or topup_session_expires_at <= topup_session_started_at
+                or (topup_session_expires_at - topup_session_started_at) > (PAYMENT_UPLOAD_SESSION_SECONDS + 15)
+            ):
+                self._send_json(
+                    400,
+                    {
+                        "error": (
+                            "To'ldirish sessiyasi noto'g'ri. Qaytadan boshlang."
+                            if language == "uz"
+                            else "Сессия пополнения недействительна. Начните заново."
+                        )
+                    },
+                )
+                return
+
+            now_ts = int(time.time())
+            if now_ts > topup_session_expires_at:
+                self._send_json(
+                    400,
+                    {
+                        "error": (
+                            "To'ldirish sessiyasi tugadi. Qaytadan boshlang."
+                            if language == "uz"
+                            else "Сессия пополнения истекла. Начните заново."
+                        )
+                    },
+                )
+                return
+
+            prime_result = PAYMENT_VERIFIER.prime_balance_session(
+                session_id=topup_session_id,
+                user_id=user_id,
+                flow="balance_topup",
+                session_started_at=topup_session_started_at,
+                session_expires_at=topup_session_expires_at,
+            )
+            if not bool(prime_result.get("ok")):
+                raw_reason = str(prime_result.get("reason", "")).strip() or (
+                    "Не удалось получить стартовый баланс карты"
+                )
+                self._send_json(
+                    503,
+                    {
+                        "error": localize_payment_reason(raw_reason, language),
+                        "ok": False,
+                        "sessionId": topup_session_id,
+                        "preBalanceCaptured": False,
+                    },
+                )
+                return
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "sessionId": topup_session_id,
+                    "preBalanceCaptured": True,
+                    "preBalance": int(prime_result.get("pre_balance", 0) or 0),
+                    "targetCardLast4": str(prime_result.get("target_card_last4", "")).strip(),
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
         if path == "/api/balance-topup":
             try:
                 user_id = int(payload.get("userId", 0))
@@ -4323,6 +7761,15 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 topup_session_expires_at = int(payload.get("topupSessionExpiresAt", 0))
             except (TypeError, ValueError):
                 topup_session_expires_at = 0
+
+            touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source="api_balance_topup",
+                language=language,
+            )
 
             if user_id <= 0 or not screenshot_data_url:
                 self._send_json(400, {"error": "Missing required fields"})
@@ -4459,12 +7906,18 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
 
             if not bool(payment_verification.get("ok")):
                 raw_reason = str(payment_verification.get("reason", "")).strip() or "Пополнение не подтверждено"
+                verification_decision = str(payment_verification.get("decision", "")).strip().upper()
+                manual_review = verification_decision == "MANUAL_REVIEW"
                 technical_error = is_technical_payment_verification_error(raw_reason)
+                friendly_reason = user_friendly_payment_reason(raw_reason, language)
                 localized_reason = localize_payment_reason(raw_reason, language)
                 ban_seconds_remaining = 0
                 is_user_banned = False
                 violation_status = {}
-                if technical_error:
+                if manual_review:
+                    remaining_attempts = int(attempt_status.get("remaining", PAYMENT_MAX_SCREENSHOT_ATTEMPTS))
+                    response_reason = friendly_reason
+                elif technical_error:
                     remaining_attempts = int(attempt_status.get("remaining", PAYMENT_MAX_SCREENSHOT_ATTEMPTS))
                     response_reason = (
                         f"{localized_reason}. 1-2 daqiqadan keyin qayta urinib ko'ring."
@@ -4486,35 +7939,36 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     if is_user_banned:
                         remaining_attempts = 0
                         response_reason = format_payment_ban_reason(
-                            reason=raw_reason,
+                            reason=friendly_reason,
                             seconds_remaining=ban_seconds_remaining,
                             language=language,
                         )
                     elif remaining_attempts > 0:
                         if language == "uz":
                             response_reason = (
-                                f"{localized_reason}. To'g'ri skrinshotni yana yuboring. "
+                                f"{friendly_reason} "
                                 f"Qolgan urinishlar: {remaining_attempts} / {PAYMENT_MAX_SCREENSHOT_ATTEMPTS}."
                             )
                         else:
                             response_reason = (
-                                f"{localized_reason}. Попробуйте отправить корректный скриншот ещё раз. "
+                                f"{friendly_reason} "
                                 f"Осталось попыток: {remaining_attempts} из {PAYMENT_MAX_SCREENSHOT_ATTEMPTS}."
                             )
                     else:
                         response_reason = (
-                            f"{localized_reason}. Urinishlar limiti tugadi. "
+                            f"{friendly_reason} Urinishlar limiti tugadi. "
                             "To'ldirish sessiyasi yakunlandi, qaytadan boshlang."
                             if language == "uz"
                             else (
-                                f"{localized_reason}. Лимит попыток исчерпан. "
+                                f"{friendly_reason} Лимит попыток исчерпан. "
                                 "Сессия пополнения завершена, начните заново."
                             )
                         )
 
+                notify_reason = localized_reason if technical_error else friendly_reason
                 send_payment_verification_failed_message(
                     user_id=user_id,
-                    reason=raw_reason,
+                    reason=notify_reason,
                     remaining_attempts=remaining_attempts,
                     max_attempts=PAYMENT_MAX_SCREENSHOT_ATTEMPTS,
                     language=language,
@@ -4522,13 +7976,14 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     ban_seconds_remaining=ban_seconds_remaining,
                 )
                 status_code = 400
-                if is_user_banned or remaining_attempts <= 0:
+                if not manual_review and (is_user_banned or remaining_attempts <= 0):
                     status_code = 429
                 self._send_json(
                     status_code,
                     {
                         "error": response_reason,
                         "paymentVerified": False,
+                        "paymentDecision": verification_decision or "REJECT",
                         "paymentBanned": bool(is_user_banned),
                         "blockedUntil": int(violation_status.get("blocked_until", 0) or 0)
                         if (not technical_error and is_user_banned)
@@ -4602,6 +8057,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     "paymentVerification": {
                         "ok": bool(payment_verification.get("ok")),
                         "mode": str(payment_verification.get("mode", "")),
+                        "decision": str(payment_verification.get("decision", "")),
+                        "confidence": float(payment_verification.get("confidence", 0) or 0),
                     },
                     "balance": {
                         "balance": int(balance_after),
@@ -4671,6 +8128,15 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             use_balance = str(use_balance_raw).strip().lower() in {"1", "true", "yes", "on"}
         if language not in {"ru", "uz"}:
             language = "ru"
+
+        touch_user_activity(
+            user_id,
+            username=username,
+            first_name=first_name,
+            last_name=last_name,
+            source="api_purchase_confirmed",
+            language=language,
+        )
 
         if (
             user_id <= 0
@@ -4865,12 +8331,18 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             )
             if not bool(payment_verification.get("ok")):
                 raw_reason = str(payment_verification.get("reason", "")).strip() or "Payment verification failed"
+                verification_decision = str(payment_verification.get("decision", "")).strip().upper()
+                manual_review = verification_decision == "MANUAL_REVIEW"
                 technical_error = is_technical_payment_verification_error(raw_reason)
+                friendly_reason = user_friendly_payment_reason(raw_reason, language)
                 localized_reason = localize_payment_reason(raw_reason, language)
                 ban_seconds_remaining = 0
                 is_user_banned = False
                 violation_status = {}
-                if technical_error:
+                if manual_review:
+                    remaining_attempts = int(attempt_status.get("remaining", PAYMENT_MAX_SCREENSHOT_ATTEMPTS))
+                    response_reason = friendly_reason
+                elif technical_error:
                     remaining_attempts = int(attempt_status.get("remaining", PAYMENT_MAX_SCREENSHOT_ATTEMPTS))
                     response_reason = (
                         f"{localized_reason}. 1-2 daqiqadan keyin qayta urinib ko'ring."
@@ -4892,28 +8364,28 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     if is_user_banned:
                         remaining_attempts = 0
                         response_reason = format_payment_ban_reason(
-                            reason=raw_reason,
+                            reason=friendly_reason,
                             seconds_remaining=ban_seconds_remaining,
                             language=language,
                         )
                     elif remaining_attempts > 0:
                         if language == "uz":
                             response_reason = (
-                                f"{localized_reason}. To'g'ri skrinshotni yana yuboring. "
+                                f"{friendly_reason} "
                                 f"Qolgan urinishlar: {remaining_attempts} / {PAYMENT_MAX_SCREENSHOT_ATTEMPTS}."
                             )
                         else:
                             response_reason = (
-                                f"{localized_reason}. Попробуйте отправить корректный скриншот ещё раз. "
+                                f"{friendly_reason} "
                                 f"Осталось попыток: {remaining_attempts} из {PAYMENT_MAX_SCREENSHOT_ATTEMPTS}."
                             )
                     else:
                         response_reason = (
-                            f"{localized_reason}. Urinishlar limiti tugadi. "
+                            f"{friendly_reason} Urinishlar limiti tugadi. "
                             "To'lov sessiyasi yakunlandi, xaridni qaytadan boshlang."
                             if language == "uz"
                             else (
-                                f"{localized_reason}. Лимит попыток исчерпан. "
+                                f"{friendly_reason} Лимит попыток исчерпан. "
                                 "Сессия оплаты завершена, начните покупку заново."
                             )
                         )
@@ -4927,7 +8399,7 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 )
                 send_payment_verification_failed_message(
                     user_id=user_id,
-                    reason=raw_reason,
+                    reason=(localized_reason if technical_error else friendly_reason),
                     remaining_attempts=remaining_attempts,
                     max_attempts=PAYMENT_MAX_SCREENSHOT_ATTEMPTS,
                     language=language,
@@ -4935,13 +8407,14 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                     ban_seconds_remaining=ban_seconds_remaining,
                 )
                 status_code = 400
-                if is_user_banned or remaining_attempts <= 0:
+                if not manual_review and (is_user_banned or remaining_attempts <= 0):
                     status_code = 429
                 self._send_json(
                     status_code,
                     {
                         "error": response_reason,
                         "paymentVerified": False,
+                        "paymentDecision": verification_decision or "REJECT",
                         "paymentBanned": bool(is_user_banned),
                         "blockedUntil": int(violation_status.get("blocked_until", 0) or 0)
                         if (not technical_error and is_user_banned)
@@ -5078,11 +8551,12 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 password="-",
                 language=language,
                 amount=amount,
-                product_type="bonus",
+                product_type=PRODUCT_TYPE_BONUS,
                 steam_id=bonus_result["steam_id"],
                 bonus_added=bonus_result["added"],
                 bonus_before=bonus_result["before"],
                 bonus_after=bonus_result["after"],
+                source="purchase",
             )
             purchase_record["payment_verification"] = dict(payment_verification)
         else:
@@ -5175,6 +8649,11 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             issued_privilege_name = str(issue_result.get("privilege", privilege)) if issue_result else str(privilege)
             issued_nickname_value = str(issue_result.get("nickname", nickname)) if issue_result else str(nickname)
             issued_steam_id_value = str(issue_result.get("steam_id", steam_id)) if issue_result else str(steam_id)
+            effective_record_password = (
+                str(issue_result.get("effective_password", "")).strip()
+                if issue_result
+                else (str(password or "").strip() if identifier_type == PRIVILEGE_IDENTIFIER_NICKNAME else "")
+            )
 
             cashback_percent = _get_privilege_cashback_percent(issued_privilege_name)
             cashback_amount = _calculate_privilege_cashback_amount(issued_privilege_name, charged_amount)
@@ -5256,13 +8735,15 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 password=password,
                 language=language,
                 amount=amount,
-                product_type="privilege",
+                product_type=PRODUCT_TYPE_PRIVILEGE,
                 identifier_type=identifier_type,
                 steam_id=(
                     issued_steam_id_value
                     if issue_result
                     else (steam_id if identifier_type == PRIVILEGE_IDENTIFIER_STEAM else "")
                 ),
+                source="purchase",
+                renew_password=effective_record_password,
             )
             purchase_record["payment_verification"] = dict(payment_verification)
             if issue_result:
@@ -5343,6 +8824,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 "paymentVerification": {
                     "ok": bool(payment_verification.get("ok")),
                     "mode": str(payment_verification.get("mode", "")),
+                    "decision": str(payment_verification.get("decision", "")),
+                    "confidence": float(payment_verification.get("confidence", 0) or 0),
                 },
                 "balance": balance_payload,
                 "cashback": (
@@ -5379,6 +8862,145 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "timestamp": int(time.time())})
             return
 
+        if path == "/api/activity-ping":
+            try:
+                user_id = int(str(query_params.get("userId", ["0"])[0]).strip())
+            except (TypeError, ValueError):
+                user_id = 0
+            username = str(query_params.get("username", [""])[0]).strip().lstrip("@")
+            first_name = str(query_params.get("firstName", [""])[0]).strip()
+            last_name = str(query_params.get("lastName", [""])[0]).strip()
+            language = str(query_params.get("language", [""])[0]).strip().lower()
+            if language not in {"ru", "uz"}:
+                language = ""
+            source = str(query_params.get("source", ["miniapp"])[0]).strip() or "miniapp"
+            if user_id <= 0:
+                self._send_json(400, {"error": "userId is required"})
+                return
+
+            activity = touch_user_activity(
+                user_id,
+                username=username,
+                first_name=first_name,
+                last_name=last_name,
+                source=source,
+                language=language,
+            ) or {}
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "activity": {
+                        "lastActivityAt": int(activity.get("last_activity_at", 0) or 0),
+                        "source": str(activity.get("source", "")).strip(),
+                        "language": _normalize_broadcast_language(activity.get("language", "")),
+                    },
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/admin/summary":
+            if not self._require_admin_authorization():
+                return
+            snapshot = get_admin_dashboard_snapshot(
+                page=1,
+                page_size=ADMIN_DEFAULT_PAGE_SIZE,
+                search="",
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "summary": dict(snapshot.get("summary", {})),
+                    "generatedAt": int(snapshot.get("generatedAt", 0) or 0),
+                    "timestamp": int(time.time()),
+                    "security": {
+                        "adminKeyRequired": bool(ADMIN_DASHBOARD_KEY),
+                    },
+                },
+            )
+            return
+
+        if path == "/api/admin/users":
+            if not self._require_admin_authorization():
+                return
+            try:
+                page = int(str(query_params.get("page", ["1"])[0]).strip())
+            except (TypeError, ValueError):
+                page = 1
+            try:
+                page_size = int(str(query_params.get("pageSize", [str(ADMIN_DEFAULT_PAGE_SIZE)])[0]).strip())
+            except (TypeError, ValueError):
+                page_size = ADMIN_DEFAULT_PAGE_SIZE
+            search = str(query_params.get("search", [""])[0]).strip()
+
+            snapshot = get_admin_dashboard_snapshot(
+                page=page,
+                page_size=page_size,
+                search=search,
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "items": list(snapshot.get("items", [])),
+                    "page": int(snapshot.get("page", 1) or 1),
+                    "pageSize": int(snapshot.get("pageSize", ADMIN_DEFAULT_PAGE_SIZE) or ADMIN_DEFAULT_PAGE_SIZE),
+                    "totalItems": int(snapshot.get("totalItems", 0) or 0),
+                    "totalPages": int(snapshot.get("totalPages", 1) or 1),
+                    "search": str(snapshot.get("search", "")).strip(),
+                    "generatedAt": int(snapshot.get("generatedAt", 0) or 0),
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/admin/broadcasts/campaigns":
+            if not self._require_admin_authorization():
+                return
+            try:
+                limit = int(str(query_params.get("limit", ["30"])[0]).strip())
+            except (TypeError, ValueError):
+                limit = 30
+            campaigns = get_admin_broadcast_campaigns(limit=limit)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "items": campaigns,
+                    "total": len(campaigns),
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
+        if path == "/api/admin/broadcasts/campaign":
+            if not self._require_admin_authorization():
+                return
+            campaign_id = str(query_params.get("campaignId", [""])[0]).strip()
+            try:
+                logs_limit = int(str(query_params.get("logsLimit", ["300"])[0]).strip())
+            except (TypeError, ValueError):
+                logs_limit = 300
+            try:
+                campaign = get_admin_broadcast_campaign_details(
+                    campaign_id,
+                    logs_limit=logs_limit,
+                )
+            except ValueError as error:
+                self._send_json(404, {"error": str(error)})
+                return
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "campaign": campaign,
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
         if path == "/api/balance":
             try:
                 user_id = int(str(query_params.get("userId", ["0"])[0]).strip())
@@ -5387,6 +9009,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             if user_id <= 0:
                 self._send_json(400, {"error": "userId is required"})
                 return
+
+            touch_user_activity(user_id, source="api_balance")
 
             balance_snapshot = get_user_balance_snapshot(user_id)
             self._send_json(
@@ -5400,6 +9024,42 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/welcome-bonus-status":
+            try:
+                user_id = int(str(query_params.get("userId", ["0"])[0]).strip())
+            except (TypeError, ValueError):
+                user_id = 0
+            if user_id <= 0:
+                self._send_json(400, {"error": "userId is required"})
+                return
+
+            touch_user_activity(user_id, source="api_welcome_bonus_status")
+            claim_snapshot = get_welcome_bonus_claim_snapshot(user_id)
+            claimed_at = int(_safe_int(claim_snapshot.get("claimed_at", 0), 0))
+            claimed_amount = int(max(_safe_int(claim_snapshot.get("amount", 0), 0), 0))
+            effective_amount = claimed_amount if claimed_amount > 0 else int(WELCOME_BONUS_AMOUNT)
+            balance_snapshot = get_user_balance_snapshot(user_id)
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "bonusAmount": int(WELCOME_BONUS_AMOUNT),
+                    "status": {
+                        "eligible": bool(WELCOME_BONUS_AMOUNT > 0 and claimed_at <= 0),
+                        "claimed": bool(claimed_at > 0),
+                        "claimedAt": int(claimed_at),
+                        "amount": int(max(effective_amount, 0)),
+                    },
+                    "balance": {
+                        "balance": int(balance_snapshot.get("balance", 0) or 0),
+                        "updatedAt": int(balance_snapshot.get("updated_at", 0) or 0),
+                    },
+                    "timestamp": int(time.time()),
+                },
+            )
+            return
+
         if path == "/api/balance-history":
             try:
                 user_id = int(str(query_params.get("userId", ["0"])[0]).strip())
@@ -5408,6 +9068,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             if user_id <= 0:
                 self._send_json(400, {"error": "userId is required"})
                 return
+
+            touch_user_activity(user_id, source="api_balance_history")
 
             try:
                 limit = int(str(query_params.get("limit", ["120"])[0]).strip())
@@ -5450,6 +9112,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "userId is required"})
                 return
 
+            touch_user_activity(user_id, source="api_user_privileges")
+
             try:
                 limit = int(str(query_params.get("limit", ["30"])[0]).strip())
             except (TypeError, ValueError):
@@ -5475,6 +9139,9 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                             "totalDays": int(item.get("total_days", 0) or 0),
                             "daysPassed": int(item.get("days_passed", 0) or 0),
                             "canRenew": bool(item.get("can_renew")),
+                            "source": str(item.get("source", "")).strip().lower(),
+                            "password": str(item.get("password", "")).strip(),
+                            "isPermanent": bool(item.get("is_permanent")),
                         }
                         for item in snapshots
                     ],
@@ -5493,6 +9160,8 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             if user_id <= 0:
                 self._send_json(400, {"error": "userId is required"})
                 return
+
+            touch_user_activity(user_id, source="api_payment_status")
 
             violation = get_user_payment_violation_status(
                 user_id,
@@ -5699,6 +9368,7 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message or not message.text:
         return
 
+    touch_user_activity_from_update(update, source="buttons_handler")
     text = message.text
 
     if text == "🌐 Servers":
@@ -5795,6 +9465,7 @@ def run_telegram_bot_forever():
 
 def main():
     start_api_server()
+    start_broadcast_worker()
 
     run_telegram = os.getenv("RUN_TELEGRAM_BOT", "1").strip().lower() not in {"0", "false", "no"}
     if not run_telegram:

@@ -9,6 +9,7 @@ import { BalanceTopUpModal } from "./BalanceTopUpModal";
 import { useBalanceTopUp } from "../context/BalanceTopUpContext";
 import { hasActiveTopUpUploadSession } from "../lib/balanceTopUpFlow";
 import type { BalanceTopUpResponse } from "../api/strikeApi";
+import { sendActivityPing } from "../api/strikeApi";
 
 export function Layout() {
   const location = useLocation();
@@ -56,6 +57,40 @@ export function Layout() {
       openTopUp();
     }
   }, [openTopUp, telegramUserId]);
+
+  useEffect(() => {
+    if (telegramUserId <= 0 || typeof window === "undefined") {
+      return;
+    }
+
+    const tgUser = (
+      window as Window & {
+        Telegram?: {
+          WebApp?: {
+            initDataUnsafe?: {
+              user?: {
+                id?: number;
+                username?: string;
+                first_name?: string;
+                last_name?: string;
+              };
+            };
+          };
+        };
+      }
+    ).Telegram?.WebApp?.initDataUnsafe?.user;
+
+    sendActivityPing({
+      userId: telegramUserId,
+      username: tgUser?.username ?? "",
+      firstName: tgUser?.first_name ?? "",
+      lastName: tgUser?.last_name ?? "",
+      source: "miniapp_open",
+      language,
+    }).catch(() => {
+      // ignore activity ping errors
+    });
+  }, [language, telegramUserId]);
 
   const handleTopUpSuccess = (response: BalanceTopUpResponse) => {
     if (typeof window === "undefined") {

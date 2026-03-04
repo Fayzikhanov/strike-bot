@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
-import { ChevronDown, Clock3, PlusCircle, WalletCards } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, Clock3, KeyRound, Loader2, PlusCircle, Server, ShieldCheck, UserRound, WalletCards } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { PageTransition } from "../components/PageTransition";
 import { useLanguage } from "../i18n/LanguageContext";
 import {
+  claimWelcomeBonus,
+  fetchServers,
   fetchUserBalance,
   fetchUserBalanceHistory,
+  submitLegacyPrivilegeImport,
+  fetchWelcomeBonusStatus,
   type BalanceHistoryItem,
+  type LiveServer,
   fetchUserPrivileges,
   type UserPrivilegeItem,
 } from "../api/strikeApi";
@@ -17,6 +22,13 @@ type TelegramUser = {
   username?: string;
   first_name?: string;
   last_name?: string;
+};
+
+type WelcomeBonusStatus = {
+  eligible: boolean;
+  claimed: boolean;
+  claimedAt: number;
+  amount: number;
 };
 
 function formatMoney(value: number): string {
@@ -84,6 +96,12 @@ function buildHistoryTitle(item: BalanceHistoryItem, language: "ru" | "uz"): str
   const meta = item.meta ?? {};
   const productType = getMetaString(meta, "product_type").toLowerCase();
 
+  if (item.type === "welcome_bonus") {
+    return isUz ? "Start bonusi olindi" : "Получен стартовый бонус";
+  }
+  if (item.type === "legacy_import") {
+    return isUz ? "Legacy import: imtiyoz qo'shildi" : "Legacy import: привилегия добавлена";
+  }
   if (item.type === "topup") {
     return isUz ? "Balans to'ldirildi" : "Пополнение баланса";
   }
@@ -108,6 +126,32 @@ function buildHistoryDetails(item: BalanceHistoryItem, language: "ru" | "uz"): s
   const cashbackPercent = getMetaNumber(meta, "cashback_percent");
   const bonusAmount = getMetaNumber(meta, "bonus_amount");
   const productType = getMetaString(meta, "product_type").toLowerCase();
+
+  if (item.type === "welcome_bonus") {
+    return isUz
+      ? "Start bonusi bir martalik tarzda balansga qo'shildi."
+      : "Разовый стартовый бонус зачислен на баланс.";
+  }
+
+  if (item.type === "legacy_import") {
+    const parts: string[] = [];
+    const isPermanent = Boolean(meta.is_permanent);
+    if (serverName) {
+      parts.push(`${isUz ? "Server" : "Сервер"}: ${serverName}`);
+    }
+    if (privilege) {
+      parts.push(`${isUz ? "Imtiyoz" : "Привилегия"}: ${privilege}`);
+    }
+    if (isPermanent) {
+      parts.push(isUz ? "Muddat: doimiy" : "Срок: постоянная");
+    } else if (durationMonths > 0) {
+      parts.push(`${isUz ? "Import" : "Импорт"}: ${durationMonths} ${isUz ? "oy" : "мес."}`);
+    }
+    if (parts.length > 0) {
+      return parts.join(" • ");
+    }
+    return isUz ? "Mavjud imtiyoz profilingizga biriktirildi." : "Существующая привилегия привязана к профилю.";
+  }
 
   if (item.type === "topup") {
     return isUz
@@ -156,6 +200,18 @@ export function Profile() {
   const [balance, setBalance] = useState(0);
   const [isLoadingBalance, setIsLoadingBalance] = useState(false);
   const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [welcomeBonusStatus, setWelcomeBonusStatus] = useState<WelcomeBonusStatus | null>(null);
+  const [isLoadingWelcomeBonus, setIsLoadingWelcomeBonus] = useState(false);
+  const [isClaimingWelcomeBonus, setIsClaimingWelcomeBonus] = useState(false);
+  const [welcomeBonusError, setWelcomeBonusError] = useState<string | null>(null);
+  const [welcomeBonusToast, setWelcomeBonusToast] = useState<{
+    amount: number;
+    balanceAfter: number;
+  } | null>(null);
+  const [topUpToast, setTopUpToast] = useState<{
+    amount: number;
+    balanceAfter: number;
+  } | null>(null);
   const [historyItems, setHistoryItems] = useState<BalanceHistoryItem[]>([]);
   const [isLoadingHistory, setIsLoadingHistory] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -166,6 +222,23 @@ export function Profile() {
   const [isLedgerExpanded, setIsLedgerExpanded] = useState(false);
   const [activeHistoryMonth, setActiveHistoryMonth] = useState("all");
   const [visibleHistoryCount, setVisibleHistoryCount] = useState(8);
+  const [legacyServers, setLegacyServers] = useState<LiveServer[]>([]);
+  const [isLoadingLegacyServers, setIsLoadingLegacyServers] = useState(false);
+  const [isLegacyModalOpen, setIsLegacyModalOpen] = useState(false);
+  const [legacyStep, setLegacyStep] = useState<1 | 2 | 3>(1);
+  const [legacyServerId, setLegacyServerId] = useState("");
+  const [legacyIdentifierType, setLegacyIdentifierType] = useState<"nickname" | "steam">("nickname");
+  const [legacyNickname, setLegacyNickname] = useState("");
+  const [legacySteamId, setLegacySteamId] = useState("");
+  const [legacyPassword, setLegacyPassword] = useState("");
+  const [legacyError, setLegacyError] = useState<string | null>(null);
+  const [isSubmittingLegacy, setIsSubmittingLegacy] = useState(false);
+  const [legacyImportToast, setLegacyImportToast] = useState<{
+    title: string;
+    details: string;
+  } | null>(null);
+  const [highlightPrivilegeId, setHighlightPrivilegeId] = useState("");
+  const activePrivilegesRef = useRef<HTMLDivElement | null>(null);
   const { openTopUp } = useBalanceTopUp();
   const navigate = useNavigate();
 
@@ -207,6 +280,52 @@ export function Profile() {
     return isUz ? "Foydalanuvchi" : "Пользователь";
   }, [isUz, user]);
 
+  const selectedLegacyServer = useMemo(
+    () => legacyServers.find((server) => server.id === legacyServerId) ?? null,
+    [legacyServerId, legacyServers],
+  );
+
+  const resetLegacyImportState = useCallback(() => {
+    setLegacyStep(1);
+    setLegacyServerId("");
+    setLegacyIdentifierType("nickname");
+    setLegacyNickname("");
+    setLegacySteamId("");
+    setLegacyPassword("");
+    setLegacyError(null);
+    setIsSubmittingLegacy(false);
+  }, []);
+
+  const loadLegacyServers = useCallback(async () => {
+    setIsLoadingLegacyServers(true);
+    try {
+      const servers = await fetchServers();
+      setLegacyServers(servers);
+      setLegacyError(null);
+    } catch {
+      setLegacyError(
+        isUz
+          ? "Serverlar ro'yxatini yuklab bo'lmadi."
+          : "Не удалось загрузить список серверов.",
+      );
+    } finally {
+      setIsLoadingLegacyServers(false);
+    }
+  }, [isUz]);
+
+  const openLegacyImportModal = useCallback(() => {
+    resetLegacyImportState();
+    setIsLegacyModalOpen(true);
+    void loadLegacyServers();
+  }, [loadLegacyServers, resetLegacyImportState]);
+
+  const closeLegacyImportModal = useCallback(() => {
+    if (isSubmittingLegacy) {
+      return;
+    }
+    setIsLegacyModalOpen(false);
+  }, [isSubmittingLegacy]);
+
   const loadBalance = useCallback(async (withLoader: boolean) => {
     if (telegramUserId <= 0) {
       setBalance(0);
@@ -228,6 +347,36 @@ export function Profile() {
     } finally {
       if (withLoader) {
         setIsLoadingBalance(false);
+      }
+    }
+  }, [isUz, telegramUserId]);
+
+  const loadWelcomeBonusStatus = useCallback(async (withLoader: boolean) => {
+    if (telegramUserId <= 0) {
+      setWelcomeBonusStatus(null);
+      return;
+    }
+    if (withLoader) {
+      setIsLoadingWelcomeBonus(true);
+    }
+    try {
+      const response = await fetchWelcomeBonusStatus(telegramUserId);
+      setWelcomeBonusStatus({
+        eligible: Boolean(response.status?.eligible),
+        claimed: Boolean(response.status?.claimed),
+        claimedAt: Math.max(0, Number(response.status?.claimedAt || 0)),
+        amount: Math.max(0, Number(response.status?.amount ?? response.bonusAmount ?? 0)),
+      });
+      setWelcomeBonusError(null);
+    } catch {
+      setWelcomeBonusError(
+        isUz
+          ? "Start bonusi holatini yuklab bo'lmadi."
+          : "Не удалось загрузить статус стартового бонуса.",
+      );
+    } finally {
+      if (withLoader) {
+        setIsLoadingWelcomeBonus(false);
       }
     }
   }, [isUz, telegramUserId]);
@@ -257,6 +406,54 @@ export function Profile() {
     }
   }, [isUz, telegramUserId]);
 
+  const handleClaimWelcomeBonus = useCallback(async () => {
+    if (telegramUserId <= 0 || isClaimingWelcomeBonus) {
+      return;
+    }
+    setIsClaimingWelcomeBonus(true);
+    setWelcomeBonusError(null);
+
+    try {
+      const requestId = (
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `${telegramUserId}-${Date.now()}`
+      );
+      const response = await claimWelcomeBonus({
+        userId: telegramUserId,
+        username: user?.username,
+        firstName: user?.first_name,
+        lastName: user?.last_name,
+        requestId,
+        language,
+      });
+
+      setWelcomeBonusStatus({
+        eligible: false,
+        claimed: true,
+        claimedAt: Math.max(0, Number(response.claim?.claimedAt || 0)),
+        amount: Math.max(0, Number(response.claim?.amount ?? response.bonusAmount ?? 0)),
+      });
+      setBalance(Math.max(0, Number(response.balanceAfter || 0)));
+      if (Boolean(response.claimed)) {
+        setWelcomeBonusToast({
+          amount: Math.max(0, Number(response.claim?.amount ?? response.bonusAmount ?? 0)),
+          balanceAfter: Math.max(0, Number(response.balanceAfter || 0)),
+        });
+      }
+      void loadHistory(false);
+    } catch {
+      setWelcomeBonusError(
+        isUz
+          ? "Start bonusini olishda xatolik yuz berdi. Qayta urinib ko'ring."
+          : "Не удалось получить стартовый бонус. Попробуйте снова.",
+      );
+      void loadWelcomeBonusStatus(false);
+    } finally {
+      setIsClaimingWelcomeBonus(false);
+    }
+  }, [isClaimingWelcomeBonus, isUz, language, loadHistory, loadWelcomeBonusStatus, telegramUserId, user?.first_name, user?.last_name, user?.username]);
+
   const loadPrivileges = useCallback(async (withLoader: boolean) => {
     if (telegramUserId <= 0) {
       setPrivilegeItems([]);
@@ -282,11 +479,162 @@ export function Profile() {
     }
   }, [isUz, telegramUserId]);
 
+  const goLegacyNextStep = useCallback(() => {
+    setLegacyError(null);
+    if (legacyStep === 1) {
+      if (!legacyServerId) {
+        setLegacyError(isUz ? "Serverni tanlang." : "Выберите сервер.");
+        return;
+      }
+      setLegacyStep(2);
+      return;
+    }
+
+    if (legacyStep === 2) {
+      if (legacyIdentifierType === "steam") {
+        if (!legacySteamId.trim()) {
+          setLegacyError(isUz ? "STEAM_ID kiriting." : "Введите STEAM_ID.");
+          return;
+        }
+      } else if (!legacyNickname.trim()) {
+        setLegacyError(isUz ? "Nick kiriting." : "Введите Nick.");
+        return;
+      }
+      setLegacyStep(3);
+    }
+  }, [
+    isUz,
+    legacyIdentifierType,
+    legacyNickname,
+    legacyServerId,
+    legacySteamId,
+    legacyStep,
+  ]);
+
+  const goLegacyPrevStep = useCallback(() => {
+    setLegacyError(null);
+    setLegacyStep((prev) => {
+      if (prev <= 1) {
+        return 1;
+      }
+      return (prev - 1) as 1 | 2 | 3;
+    });
+  }, []);
+
+  const handleLegacyImportSubmit = useCallback(async () => {
+    if (telegramUserId <= 0) {
+      setLegacyError(
+        isUz
+          ? "Telegram foydalanuvchisini aniqlab bo'lmadi."
+          : "Не удалось определить Telegram пользователя.",
+      );
+      return;
+    }
+    if (!legacyServerId) {
+      setLegacyError(isUz ? "Serverni tanlang." : "Выберите сервер.");
+      return;
+    }
+    if (legacyIdentifierType === "steam") {
+      if (!legacySteamId.trim()) {
+        setLegacyError(isUz ? "STEAM_ID kiriting." : "Введите STEAM_ID.");
+        return;
+      }
+    } else {
+      if (!legacyNickname.trim()) {
+        setLegacyError(isUz ? "Nick kiriting." : "Введите Nick.");
+        return;
+      }
+    }
+    if (!legacyPassword.trim()) {
+      setLegacyError(isUz ? "Parolni kiriting." : "Введите пароль.");
+      return;
+    }
+
+    setIsSubmittingLegacy(true);
+    setLegacyError(null);
+    try {
+      const response = await submitLegacyPrivilegeImport({
+        userId: telegramUserId,
+        username: user?.username,
+        firstName: user?.first_name,
+        lastName: user?.last_name,
+        serverId: legacyServerId,
+        serverName: selectedLegacyServer?.name ?? "",
+        identifierType: legacyIdentifierType,
+        nickname: legacyIdentifierType === "nickname" ? legacyNickname.trim() : "",
+        steamId: legacyIdentifierType === "steam" ? legacySteamId.trim().toUpperCase() : "",
+        password: legacyPassword.trim(),
+        language,
+      });
+
+      const importedItem = response.privilegeItem;
+      if (importedItem) {
+        setPrivilegeItems((current) => {
+          const withoutDuplicate = current.filter((item) => item.id !== importedItem.id);
+          return [importedItem, ...withoutDuplicate].sort(
+            (left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0),
+          );
+        });
+        setHighlightPrivilegeId(importedItem.id);
+      }
+
+      await Promise.all([loadPrivileges(false), loadHistory(false)]);
+      setIsPrivilegesExpanded(true);
+      window.setTimeout(() => {
+        activePrivilegesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 120);
+      if (importedItem?.id) {
+        window.setTimeout(() => {
+          setHighlightPrivilegeId("");
+        }, 4500);
+      }
+
+      const toastTitle = response.alreadyImported
+        ? (isUz ? "Imtiyoz allaqachon bog'langan" : "Привилегия уже привязана")
+        : (isUz ? "Imtiyoz profilga qo'shildi" : "Привилегия добавлена в профиль");
+      const importedServer = response.imported?.serverName || selectedLegacyServer?.name || "-";
+      const importedPrivilege = response.imported?.privilege || "-";
+      const reportHint = response.reportSent
+        ? (isUz ? "Admin guruhiga hisobot yuborildi." : "Отчёт в админ-группу отправлен.")
+        : (isUz ? "Admin guruhiga hisobot yuborilmadi." : "Отчёт в админ-группу не отправлен.");
+      setLegacyImportToast({
+        title: toastTitle,
+        details: `${importedPrivilege} • ${importedServer}. ${reportHint}`,
+      });
+      setIsLegacyModalOpen(false);
+      resetLegacyImportState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      setLegacyError(
+        message || (isUz ? "Importda xatolik yuz berdi." : "Не удалось импортировать привилегию."),
+      );
+    } finally {
+      setIsSubmittingLegacy(false);
+    }
+  }, [
+    isUz,
+    language,
+    legacyIdentifierType,
+    legacyNickname,
+    legacyPassword,
+    legacyServerId,
+    legacySteamId,
+    loadHistory,
+    loadPrivileges,
+    resetLegacyImportState,
+    selectedLegacyServer?.name,
+    telegramUserId,
+    user?.first_name,
+    user?.last_name,
+    user?.username,
+  ]);
+
   useEffect(() => {
     void loadBalance(true);
+    void loadWelcomeBonusStatus(true);
     void loadHistory(true);
     void loadPrivileges(true);
-  }, [loadBalance, loadHistory, loadPrivileges]);
+  }, [loadBalance, loadHistory, loadPrivileges, loadWelcomeBonusStatus]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -296,8 +644,21 @@ export function Profile() {
   }, [loadPrivileges]);
 
   useEffect(() => {
-    const onTopUpSuccess = () => {
+    const onTopUpSuccess = (event: Event) => {
+      const customEvent = event as CustomEvent<{
+        creditedAmount?: number;
+        balanceAfter?: number;
+      }>;
+      const creditedAmount = Math.max(0, Number(customEvent.detail?.creditedAmount || 0));
+      const balanceAfter = Math.max(0, Number(customEvent.detail?.balanceAfter || 0));
+      if (creditedAmount > 0) {
+        setTopUpToast({
+          amount: creditedAmount,
+          balanceAfter,
+        });
+      }
       void loadBalance(false);
+      void loadWelcomeBonusStatus(false);
       void loadHistory(false);
       void loadPrivileges(false);
     };
@@ -305,7 +666,37 @@ export function Profile() {
     return () => {
       window.removeEventListener("strike:balance-topup-success", onTopUpSuccess);
     };
-  }, [loadBalance, loadHistory, loadPrivileges]);
+  }, [loadBalance, loadHistory, loadPrivileges, loadWelcomeBonusStatus]);
+
+  useEffect(() => {
+    if (!topUpToast) {
+      return undefined;
+    }
+    const timerId = window.setTimeout(() => {
+      setTopUpToast(null);
+    }, 4200);
+    return () => window.clearTimeout(timerId);
+  }, [topUpToast]);
+
+  useEffect(() => {
+    if (!welcomeBonusToast) {
+      return undefined;
+    }
+    const timerId = window.setTimeout(() => {
+      setWelcomeBonusToast(null);
+    }, 4200);
+    return () => window.clearTimeout(timerId);
+  }, [welcomeBonusToast]);
+
+  useEffect(() => {
+    if (!legacyImportToast) {
+      return undefined;
+    }
+    const timerId = window.setTimeout(() => {
+      setLegacyImportToast(null);
+    }, 4200);
+    return () => window.clearTimeout(timerId);
+  }, [legacyImportToast]);
 
   const availableHistoryMonths = useMemo(() => {
     const monthSet = new Set<string>();
@@ -340,6 +731,8 @@ export function Profile() {
   );
 
   const hasMoreHistoryItems = visibleHistoryCount < filteredHistoryItems.length;
+  const welcomeBonusAmount = Math.max(0, Number(welcomeBonusStatus?.amount || 10000));
+  const shouldShowWelcomeBonusCard = isLoadingWelcomeBonus || !Boolean(welcomeBonusStatus?.claimed);
 
   const handleRenewPrivilege = (item: UserPrivilegeItem) => {
     if (!item.canRenew || !item.serverId || !item.privilegeKey) {
@@ -357,6 +750,9 @@ export function Profile() {
       params.set("identifierType", "nickname");
       if (item.nickname) {
         params.set("nickname", item.nickname);
+      }
+      if (item.password && item.password.trim()) {
+        params.set("password", item.password.trim());
       }
     }
     navigate(`/purchase?${params.toString()}`);
@@ -410,14 +806,65 @@ export function Profile() {
             ) : (
               <p className="text-[#888888] text-xs leading-relaxed mt-3">
                 {isUz
-                  ? "Popolnenie skrinshot orqali tekshiriladi va balansga qo'shiladi."
+                  ? "To'ldirish skrinshot bo'yicha tekshiriladi va balansga qo'shiladi."
                   : "Пополнение проверяется по скриншоту и зачисляется на баланс."}
               </p>
             )}
           </div>
 
-          <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
-            <div className="flex items-center justify-between gap-3">
+          {shouldShowWelcomeBonusCard && (
+            <div className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-[#FCFCFC] text-base font-black">
+                    {isUz ? "Start bonusi" : "Стартовый бонус"}
+                  </h2>
+                  <p className="text-[#7f7f7f] text-[11px] mt-1">
+                    {isUz
+                      ? "Bir martalik sovg'a: balansingizga bonus qo'shiladi."
+                      : "Разовый подарок: бонус на баланс для первых покупок."}
+                  </p>
+                </div>
+                <span className="rounded-full border border-[#22c55e]/50 bg-[#052e1c] px-2.5 py-1 text-[10px] font-black uppercase tracking-wide text-[#86efac]">
+                  +{formatMoney(welcomeBonusAmount)} UZS
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleClaimWelcomeBonus}
+                disabled={isLoadingWelcomeBonus || isClaimingWelcomeBonus || Boolean(welcomeBonusStatus?.claimed)}
+                className={`mt-3 w-full rounded-lg border px-3 py-2.5 text-sm font-black uppercase tracking-wide transition-colors ${
+                  welcomeBonusStatus?.claimed
+                    ? "bg-[#113322] border-[#1d7f4b] text-[#86efac] cursor-default"
+                    : "bg-[#121212] border-[#22c55e]/60 text-[#86efac] hover:border-[#22c55e]"
+                } ${
+                  isLoadingWelcomeBonus || isClaimingWelcomeBonus ? "opacity-70 cursor-wait" : ""
+                }`}
+              >
+                {isLoadingWelcomeBonus
+                  ? (isUz ? "Tekshirilmoqda..." : "Проверка...")
+                  : isClaimingWelcomeBonus
+                    ? (isUz ? "Olinmoqda..." : "Получение...")
+                    : welcomeBonusStatus?.claimed
+                      ? (isUz ? "Bonus olingan" : "Бонус получен")
+                      : (isUz ? "Bonusni olish" : "Получить бонус")}
+              </button>
+
+              <p className="text-[#888888] text-xs leading-relaxed mt-3">
+                {isUz
+                  ? "Tugmani bosing va bonusni darhol balansga oling."
+                  : "Нажмите кнопку и заберите бонус на баланс."}
+              </p>
+
+              {welcomeBonusError ? (
+                <p className="text-[#fca5a5] text-xs leading-relaxed mt-2">{welcomeBonusError}</p>
+              ) : null}
+            </div>
+          )}
+
+          <div ref={activePrivilegesRef} className="bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg p-4">
+            <div className="flex items-start justify-between gap-3">
               <div>
                 <h2 className="text-[#FCFCFC] text-base font-black">
                   {isUz ? "Faol imtiyozlar" : "Активные привилегии"}
@@ -428,19 +875,29 @@ export function Profile() {
                     : "Сервер, ник и оставшиеся дни."}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => setIsPrivilegesExpanded((prev) => !prev)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-[#2f2f2f] bg-[#121212] px-2.5 py-2 text-[#c9c9c9] text-xs font-bold uppercase tracking-wide"
-              >
-                {isPrivilegesExpanded
-                  ? (isUz ? "Yopish" : "Скрыть")
-                  : (isUz ? "Ochish" : "Открыть")}
-                <ChevronDown
-                  className={`w-3.5 h-3.5 transition-transform ${isPrivilegesExpanded ? "rotate-180" : ""}`}
-                  strokeWidth={2.1}
-                />
-              </button>
+              <div className="flex flex-col items-end gap-2">
+                <button
+                  type="button"
+                  onClick={openLegacyImportModal}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[#22c55e]/55 bg-[#0e1d14] px-2 py-1.5 text-[10px] font-black uppercase tracking-wide text-[#86efac] hover:border-[#22c55e] transition-colors"
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" strokeWidth={2.2} />
+                  {isUz ? "Mavjudni qo'shish" : "Добавить существующую"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsPrivilegesExpanded((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-[#2f2f2f] bg-[#121212] px-2.5 py-2 text-[#c9c9c9] text-xs font-bold uppercase tracking-wide"
+                >
+                  {isPrivilegesExpanded
+                    ? (isUz ? "Yopish" : "Скрыть")
+                    : (isUz ? "Ochish" : "Открыть")}
+                  <ChevronDown
+                    className={`w-3.5 h-3.5 transition-transform ${isPrivilegesExpanded ? "rotate-180" : ""}`}
+                    strokeWidth={2.1}
+                  />
+                </button>
+              </div>
             </div>
 
             {!isPrivilegesExpanded ? (
@@ -458,23 +915,42 @@ export function Profile() {
             ) : (
               <div className="space-y-2 mt-3">
                 {privilegeItems.map((item) => {
+                  const isPermanent = Boolean(item.isPermanent);
                   const safeTotalDays = Math.max(1, Number(item.totalDays || 0));
                   const safeRemainingDays = Math.max(0, Number(item.remainingDays || 0));
                   const progressPercent = Math.max(
                     0,
-                    Math.min(100, Math.round((safeRemainingDays / safeTotalDays) * 100)),
+                    Math.min(100, isPermanent ? 100 : Math.round((safeRemainingDays / safeTotalDays) * 100)),
                   );
+                  const isLegacyImported = String(item.source || "").toLowerCase() === "legacy_import";
                   const identifierValue = item.identifierType === "steam"
                     ? item.steamId
                     : item.nickname;
                   return (
-                    <div key={item.id} className="bg-[#121212] border border-[#2a2a2a] rounded-lg p-3">
+                    <div
+                      key={item.id}
+                      className={`bg-[#121212] border rounded-lg p-3 transition-colors ${
+                        highlightPrivilegeId === item.id ? "border-[#22c55e]" : "border-[#2a2a2a]"
+                      }`}
+                    >
                       <div className="flex items-center justify-between gap-2">
-                        <p className="text-[#FCFCFC] text-sm font-black">
-                          {item.privilegeLabel}
-                        </p>
+                        <div className="flex items-center gap-2">
+                          <p className="text-[#FCFCFC] text-sm font-black">
+                            {item.privilegeLabel}
+                          </p>
+                          {isLegacyImported && (
+                            <span className="rounded-full border border-[#22c55e]/50 bg-[#052e1c] px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-[#86efac]">
+                              {isUz ? "Legacy import" : "Legacy import"}
+                            </span>
+                          )}
+                          {isPermanent && (
+                            <span className="rounded-full border border-[#60a5fa]/50 bg-[#0c1f39] px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-[#93c5fd]">
+                              {isUz ? "Doimiy" : "Постоянная"}
+                            </span>
+                          )}
+                        </div>
                         <p className="text-[#F8B24E] text-xs font-black">
-                          {safeRemainingDays}/{safeTotalDays}
+                          {isPermanent ? "∞/∞" : `${safeRemainingDays}/${safeTotalDays}`}
                         </p>
                       </div>
                       <p className="text-[#a3a3a3] text-xs mt-1">{item.serverName}</p>
@@ -572,8 +1048,10 @@ export function Profile() {
                 </div>
 
                 {visibleHistoryItems.map((item) => {
-                  const isIncome = Number(item.delta || 0) >= 0;
-                  const amountValue = Math.abs(Number(item.delta || 0));
+                  const deltaValue = Number(item.delta || 0);
+                  const isIncome = deltaValue > 0;
+                  const isNeutral = deltaValue === 0;
+                  const amountValue = Math.abs(deltaValue);
                   return (
                     <div
                       key={item.id}
@@ -585,10 +1063,14 @@ export function Profile() {
                         </p>
                         <p
                           className={`text-sm font-black whitespace-nowrap ${
-                            isIncome ? "text-[#86efac]" : "text-[#fca5a5]"
+                            isNeutral
+                              ? "text-[#d4d4d4]"
+                              : isIncome
+                                ? "text-[#86efac]"
+                                : "text-[#fca5a5]"
                           }`}
                         >
-                          {isIncome ? "+" : "-"}
+                          {isNeutral ? "" : isIncome ? "+" : "-"}
                           {formatMoney(amountValue)} UZS
                         </p>
                       </div>
@@ -619,6 +1101,279 @@ export function Profile() {
           </div>
         </div>
       </div>
+
+      {isLegacyModalOpen && (
+        <div className="fixed inset-0 z-[130] bg-black/70 backdrop-blur-sm px-3 py-6 overflow-y-auto">
+          <div className="max-w-[460px] mx-auto bg-[#121212] border border-[#2a2a2a] rounded-2xl p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-[#FCFCFC] text-lg font-black">
+                  {isUz ? "Mavjud imtiyozni tasdiqlash" : "Подтвердить существующую привилегию"}
+                </h3>
+                <p className="text-[#8e8e8e] text-xs mt-1">
+                  {isUz ? `Bosqich ${legacyStep} / 3` : `Шаг ${legacyStep} / 3`}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={isSubmittingLegacy}
+                onClick={closeLegacyImportModal}
+                className="rounded-lg border border-[#303030] bg-[#1b1b1b] px-2.5 py-1.5 text-[#a8a8a8] text-xs font-bold uppercase tracking-wide disabled:opacity-60"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 mt-4">
+              {[1, 2, 3].map((step) => (
+                <div
+                  key={`legacy-step-${step}`}
+                  className={`rounded-lg border px-2 py-1.5 text-center text-[11px] font-bold uppercase tracking-wide ${
+                    legacyStep === step
+                      ? "bg-[#F08800]/20 border-[#F08800] text-[#F8B24E]"
+                      : legacyStep > step
+                        ? "bg-[#052e1c] border-[#22c55e]/40 text-[#86efac]"
+                        : "bg-[#161616] border-[#2a2a2a] text-[#818181]"
+                  }`}
+                >
+                  {step}
+                </div>
+              ))}
+            </div>
+
+            {legacyStep === 1 && (
+              <div className="mt-4 space-y-3">
+                <p className="text-[#cfcfcf] text-sm font-semibold flex items-center gap-2">
+                  <Server className="w-4 h-4 text-[#F8B24E]" /> {isUz ? "Serverni tanlang" : "Выберите сервер"}
+                </p>
+                {isLoadingLegacyServers ? (
+                  <div className="rounded-lg border border-[#2a2a2a] bg-[#161616] p-4 text-[#9f9f9f] text-sm flex items-center gap-2">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {isUz ? "Serverlar yuklanmoqda..." : "Загрузка серверов..."}
+                  </div>
+                ) : legacyServers.length === 0 ? (
+                  <div className="rounded-lg border border-[#2a2a2a] bg-[#161616] p-4 text-[#9f9f9f] text-sm">
+                    {isUz ? "Serverlar topilmadi." : "Серверы не найдены."}
+                  </div>
+                ) : (
+                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                    {legacyServers.map((server) => (
+                      <button
+                        key={`legacy-server-${server.id}`}
+                        type="button"
+                        onClick={() => {
+                          setLegacyServerId(server.id);
+                          setLegacyError(null);
+                        }}
+                        className={`w-full rounded-lg border px-3 py-2 text-left transition-colors ${
+                          legacyServerId === server.id
+                            ? "bg-[#F08800]/15 border-[#F08800] text-[#F8B24E]"
+                            : "bg-[#161616] border-[#2a2a2a] text-[#d0d0d0]"
+                        }`}
+                      >
+                        <p className="text-sm font-bold">{server.name}</p>
+                        <p className="text-[11px] text-[#9a9a9a] mt-1">
+                          ID: {server.id} • {server.players}/{server.maxPlayers}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {legacyStep === 2 && (
+              <div className="mt-4 space-y-3">
+                <p className="text-[#cfcfcf] text-sm font-semibold flex items-center gap-2">
+                  <UserRound className="w-4 h-4 text-[#F8B24E]" />
+                  {isUz ? "Nick yoki STEAM_ID kiriting" : "Укажите Nick или STEAM_ID"}
+                </p>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLegacyIdentifierType("nickname");
+                      setLegacyError(null);
+                    }}
+                    className={`rounded-lg border px-3 py-2 text-xs font-black uppercase tracking-wide ${
+                      legacyIdentifierType === "nickname"
+                        ? "bg-[#F08800]/20 border-[#F08800] text-[#F8B24E]"
+                        : "bg-[#161616] border-[#2a2a2a] text-[#b0b0b0]"
+                    }`}
+                  >
+                    Nick
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLegacyIdentifierType("steam");
+                      setLegacyError(null);
+                    }}
+                    className={`rounded-lg border px-3 py-2 text-xs font-black uppercase tracking-wide ${
+                      legacyIdentifierType === "steam"
+                        ? "bg-[#F08800]/20 border-[#F08800] text-[#F8B24E]"
+                        : "bg-[#161616] border-[#2a2a2a] text-[#b0b0b0]"
+                    }`}
+                  >
+                    STEAM_ID
+                  </button>
+                </div>
+                {legacyIdentifierType === "steam" ? (
+                  <input
+                    type="text"
+                    value={legacySteamId}
+                    onChange={(event) => {
+                      setLegacySteamId(event.target.value.toUpperCase());
+                      setLegacyError(null);
+                    }}
+                    placeholder="STEAM_0:1:123456"
+                    className="w-full bg-[#121212] border border-[#2a2a2a] rounded-lg px-3 py-2.5 text-[#FCFCFC] text-sm focus:outline-none focus:border-[#F08800]"
+                  />
+                ) : (
+                  <input
+                    type="text"
+                    value={legacyNickname}
+                    onChange={(event) => {
+                      setLegacyNickname(event.target.value);
+                      setLegacyError(null);
+                    }}
+                    placeholder={isUz ? "Nick kiriting" : "Введите Nick"}
+                    className="w-full bg-[#121212] border border-[#2a2a2a] rounded-lg px-3 py-2.5 text-[#FCFCFC] text-sm focus:outline-none focus:border-[#F08800]"
+                  />
+                )}
+              </div>
+            )}
+
+            {legacyStep === 3 && (
+              <div className="mt-4 space-y-3">
+                <p className="text-[#cfcfcf] text-sm font-semibold flex items-center gap-2">
+                  <KeyRound className="w-4 h-4 text-[#F8B24E]" />
+                  {isUz ? "Parolni tasdiqlang" : "Подтвердите пароль"}
+                </p>
+                <div className="rounded-lg border border-[#2a2a2a] bg-[#161616] p-3 text-[12px] text-[#a5a5a5]">
+                  <p>
+                    {isUz ? "Server" : "Сервер"}:{" "}
+                    <span className="text-[#FCFCFC]">{selectedLegacyServer?.name || "-"}</span>
+                  </p>
+                  <p className="mt-1">
+                    {legacyIdentifierType === "steam" ? "STEAM_ID" : "Nick"}:{" "}
+                    <span className="text-[#FCFCFC]">
+                      {legacyIdentifierType === "steam" ? legacySteamId || "-" : legacyNickname || "-"}
+                    </span>
+                  </p>
+                </div>
+                <input
+                  type="text"
+                  value={legacyPassword}
+                  onChange={(event) => {
+                    setLegacyPassword(event.target.value);
+                    setLegacyError(null);
+                  }}
+                  placeholder={
+                    isUz ? "Parolni kiriting" : "Введите пароль"
+                  }
+                  className="w-full bg-[#121212] border border-[#2a2a2a] rounded-lg px-3 py-2.5 text-[#FCFCFC] text-sm focus:outline-none focus:border-[#F08800]"
+                />
+                <p className="text-[#8f8f8f] text-xs leading-relaxed">
+                  {isUz
+                    ? "Parol users.ini dagi yozuv bilan bir xil bo'lishi kerak."
+                    : "Пароль должен совпадать с записью в users.ini."}
+                </p>
+              </div>
+            )}
+
+            {legacyError && (
+              <div className="mt-4 rounded-lg border border-[#ef4444]/40 bg-[#2d1313] px-3 py-2 text-[#fca5a5] text-xs">
+                {legacyError}
+              </div>
+            )}
+
+            <div className="grid grid-cols-2 gap-2 mt-4">
+              <button
+                type="button"
+                onClick={legacyStep === 1 ? closeLegacyImportModal : goLegacyPrevStep}
+                disabled={isSubmittingLegacy}
+                className="rounded-lg border border-[#2a2a2a] bg-[#1b1b1b] py-2.5 text-[#d0d0d0] text-xs font-black uppercase tracking-wide disabled:opacity-60"
+              >
+                {legacyStep === 1
+                  ? (isUz ? "Yopish" : "Закрыть")
+                  : (isUz ? "Orqaga" : "Назад")}
+              </button>
+              {legacyStep < 3 ? (
+                <button
+                  type="button"
+                  onClick={goLegacyNextStep}
+                  disabled={isSubmittingLegacy}
+                  className="rounded-lg border border-[#F08800] bg-[#F08800] py-2.5 text-[#121212] text-xs font-black uppercase tracking-wide disabled:opacity-60"
+                >
+                  {isUz ? "Davom etish" : "Далее"}
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleLegacyImportSubmit}
+                  disabled={isSubmittingLegacy}
+                  className="rounded-lg border border-[#22c55e] bg-[#22c55e] py-2.5 text-[#052e1c] text-xs font-black uppercase tracking-wide disabled:opacity-60 inline-flex items-center justify-center gap-2"
+                >
+                  {isSubmittingLegacy && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                  {isUz ? "Imtiyozni import qilish" : "Импортировать привилегию"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {legacyImportToast && (
+        <div className="fixed left-3 right-3 top-20 z-[131] max-w-[460px] mx-auto">
+          <div className="rounded-2xl border border-[#22c55e]/70 bg-gradient-to-br from-[#0f2a1b] to-[#0a2014] px-4 py-3 shadow-[0_12px_36px_rgba(34,197,94,0.3)]">
+            <p className="text-[#dcfce7] text-sm font-black">{legacyImportToast.title}</p>
+            <p className="text-[#9feebf] text-xs mt-1.5 leading-relaxed">{legacyImportToast.details}</p>
+          </div>
+        </div>
+      )}
+
+      {topUpToast && (
+        <div className="fixed left-3 right-3 bottom-[calc(5.3rem+env(safe-area-inset-bottom))] z-[131] max-w-[460px] mx-auto">
+          <div className="rounded-2xl border border-[#22c55e]/70 bg-gradient-to-br from-[#0f2a1b] to-[#0a2014] px-4 py-3 shadow-[0_12px_38px_rgba(34,197,94,0.32)]">
+            <p className="text-[#bbf7d0] text-xs uppercase tracking-[0.14em] font-black">
+              {isUz ? "To'ldirish muvaffaqiyatli" : "Пополнение успешно"}
+            </p>
+            <p className="text-[#dcfce7] text-sm font-black mt-1">
+              {isUz ? "Tabriklaymiz!" : "Поздравляем!"} +{formatMoney(topUpToast.amount)} UZS
+            </p>
+            <p className="text-[#86efac] text-xs mt-1">
+              {isUz
+                ? `Joriy balans: ${formatMoney(topUpToast.balanceAfter)} UZS`
+                : `Текущий баланс: ${formatMoney(topUpToast.balanceAfter)} UZS`}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {welcomeBonusToast && (
+        <div
+          className={`fixed left-3 right-3 z-[130] max-w-[460px] mx-auto ${
+            topUpToast
+              ? "bottom-[calc(5.3rem+env(safe-area-inset-bottom)+5.8rem)]"
+              : "bottom-[calc(5.3rem+env(safe-area-inset-bottom))]"
+          }`}
+        >
+          <div className="rounded-2xl border border-[#22c55e]/60 bg-gradient-to-br from-[#0f2a1b] to-[#0a2014] px-4 py-3 shadow-[0_10px_35px_rgba(34,197,94,0.25)]">
+            <p className="text-[#bbf7d0] text-xs uppercase tracking-[0.14em] font-black">
+              {isUz ? "Bonus qo'shildi" : "Бонус зачислен"}
+            </p>
+            <p className="text-[#dcfce7] text-sm font-black mt-1">
+              +{formatMoney(welcomeBonusToast.amount)} UZS
+            </p>
+            <p className="text-[#86efac] text-xs mt-1">
+              {isUz
+                ? `Joriy balans: ${formatMoney(welcomeBonusToast.balanceAfter)} UZS`
+                : `Текущий баланс: ${formatMoney(welcomeBonusToast.balanceAfter)} UZS`}
+            </p>
+          </div>
+        </div>
+      )}
     </PageTransition>
   );
 }

@@ -563,8 +563,8 @@ export function Purchase() {
   const nicknameStepCardRef = useRef<HTMLDivElement | null>(null);
   const passwordStepCardRef = useRef<HTMLDivElement | null>(null);
   const [keyboardInset, setKeyboardInset] = useState(0);
-  const paymentCardNumber = "9860 1001 2447 4881";
-  const paymentRecipientName = "Fayzixanov M.";
+  const paymentCardNumberRaw = "5614 6822 1666 1316";
+  const paymentRecipientName = "Murod Fayzixanov";
   const isAndroidDevice = useMemo(() => {
     if (typeof window === "undefined") {
       return false;
@@ -873,6 +873,10 @@ export function Purchase() {
   );
   const requestedSteamId = useMemo(
     () => String(searchParams.get("steamId") ?? "").trim().toUpperCase(),
+    [searchParams],
+  );
+  const requestedPassword = useMemo(
+    () => String(searchParams.get("password") ?? "").trim(),
     [searchParams],
   );
 
@@ -1594,7 +1598,6 @@ export function Purchase() {
       setSteamId("");
     }
 
-    setPassword("");
     setSubmissionError(null);
     setPurchaseResponse(null);
     setPaymentStatus("idle");
@@ -1602,6 +1605,9 @@ export function Purchase() {
     setCardCopied(false);
     purchaseNotificationSentRef.current = false;
     resetPrivilegeRenewalState();
+    setPassword(requestedPassword);
+    setCurrentPassword(requestedPassword);
+    setCurrentPasswordVerified(false);
     renewPrefillAppliedRef.current = true;
   }, [
     requestedRenewFlow,
@@ -1610,6 +1616,7 @@ export function Purchase() {
     servers,
     requestedIdentifierType,
     requestedNickname,
+    requestedPassword,
     requestedSteamId,
     resetPrivilegeRenewalState,
   ]);
@@ -1807,7 +1814,7 @@ export function Purchase() {
   };
 
   const handleCopyCardNumber = () => {
-    navigator.clipboard.writeText(paymentCardNumber.replace(/\s+/g, ""));
+    navigator.clipboard.writeText(paymentCardNumberRaw.replace(/\s+/g, ""));
     setCardCopied(true);
     window.setTimeout(() => setCardCopied(false), 2000);
   };

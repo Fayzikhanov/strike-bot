@@ -77,6 +77,47 @@ export interface BalanceHistoryResponse {
   timestamp: number;
 }
 
+export interface WelcomeBonusStatusResponse {
+  ok: boolean;
+  bonusAmount: number;
+  status: {
+    eligible: boolean;
+    claimed: boolean;
+    claimedAt: number;
+    amount: number;
+  };
+  balance: {
+    balance: number;
+    updatedAt: number;
+  };
+  timestamp: number;
+}
+
+export interface WelcomeBonusClaimPayload {
+  userId: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  requestId?: string;
+  language: "ru" | "uz";
+}
+
+export interface WelcomeBonusClaimResponse {
+  ok: boolean;
+  claimed: boolean;
+  alreadyClaimed: boolean;
+  bonusAmount: number;
+  claim: {
+    claimedAt: number;
+    amount: number;
+  };
+  balanceBefore: number;
+  balanceAfter: number;
+  notificationSent: boolean;
+  reportSent: boolean;
+  timestamp: number;
+}
+
 export interface UserPrivilegeItem {
   id: string;
   createdAt: number;
@@ -91,6 +132,9 @@ export interface UserPrivilegeItem {
   totalDays: number;
   daysPassed: number;
   canRenew: boolean;
+  source?: string;
+  password?: string;
+  isPermanent?: boolean;
 }
 
 export interface UserPrivilegesResponse {
@@ -112,6 +156,26 @@ export interface BalanceTopUpPayload {
   topupSessionStartedAt: number;
   topupSessionExpiresAt: number;
   language: "ru" | "uz";
+}
+
+export interface BalanceTopUpSessionStartPayload {
+  userId: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  topupSessionId: string;
+  topupSessionStartedAt: number;
+  topupSessionExpiresAt: number;
+  language: "ru" | "uz";
+}
+
+export interface BalanceTopUpSessionStartResponse {
+  ok: boolean;
+  sessionId: string;
+  preBalanceCaptured: boolean;
+  preBalance: number;
+  targetCardLast4: string;
+  timestamp: number;
 }
 
 export interface BalanceTopUpResponse {
@@ -181,6 +245,330 @@ export interface PurchaseConfirmedResponse {
   };
 }
 
+export interface AdminSummaryMetricsBlock {
+  count: number;
+  amount: number;
+}
+
+export interface AdminSummaryData {
+  totalUsers: number;
+  activeUsers24h: number;
+  usersWithBalance: number;
+  totalBalance: number;
+  payments: {
+    day: AdminSummaryMetricsBlock;
+    week: AdminSummaryMetricsBlock;
+    month: AdminSummaryMetricsBlock;
+    total: AdminSummaryMetricsBlock;
+  };
+  topups: {
+    day: AdminSummaryMetricsBlock;
+    week: AdminSummaryMetricsBlock;
+    month: AdminSummaryMetricsBlock;
+    total: AdminSummaryMetricsBlock;
+  };
+  privileges: {
+    day: number;
+    week: number;
+    month: number;
+    total: number;
+  };
+  cashback: {
+    day: number;
+    week: number;
+    month: number;
+    total: number;
+  };
+  onboarding: {
+    startedUsers: number;
+    welcomeBonusClaimedUsers: number;
+    welcomeBonusClaimRate: number;
+    welcomeBonusIssuedAmount: number;
+  };
+}
+
+export interface AdminActivePrivilegeItem {
+  id: string;
+  createdAt: number;
+  serverId: string;
+  serverName: string;
+  privilegeKey: string;
+  privilegeLabel: string;
+  identifierType: "nickname" | "steam";
+  nickname: string;
+  steamId: string;
+  remainingDays: number;
+  totalDays: number;
+  isPermanent?: boolean;
+}
+
+export interface AdminImportedPrivilegeItem {
+  id: string;
+  createdAt: number;
+  serverName: string;
+  privilege: string;
+  identifierType: "nickname" | "steam";
+  nickname: string;
+  steamId: string;
+  isPermanent?: boolean;
+  status?: string;
+  source?: string;
+}
+
+export interface AdminRecentPurchaseItem {
+  id: string;
+  createdAt: number;
+  productType: "privilege" | "bonus" | "legacy_import";
+  source?: string;
+  serverName: string;
+  privilege: string;
+  amount: number;
+  duration: string;
+  nickname: string;
+  steamId: string;
+  identifierType: "nickname" | "steam";
+}
+
+export interface AdminUserItem {
+  userId: number;
+  username: string;
+  firstName: string;
+  lastName: string;
+  displayName: string;
+  balance: number;
+  ltv: number;
+  purchaseCount: number;
+  privilegePurchaseCount: number;
+  bonusPurchaseCount: number;
+  topupCount: number;
+  topupAmount: number;
+  cashbackAmount: number;
+  adminAdjustAmount: number;
+  lastActivityAt: number;
+  activePrivileges: AdminActivePrivilegeItem[];
+  recentPurchases: AdminRecentPurchaseItem[];
+  importedCount: number;
+  importedPrivileges: AdminImportedPrivilegeItem[];
+}
+
+export interface AdminSummaryResponse {
+  ok: boolean;
+  summary: AdminSummaryData;
+  generatedAt: number;
+  timestamp: number;
+  security: {
+    adminKeyRequired: boolean;
+  };
+}
+
+export interface AdminUsersResponse {
+  ok: boolean;
+  items: AdminUserItem[];
+  page: number;
+  pageSize: number;
+  totalItems: number;
+  totalPages: number;
+  search: string;
+  generatedAt: number;
+  timestamp: number;
+}
+
+export interface AdminBalanceAdjustPayload {
+  userId: number;
+  amount: number;
+  comment: string;
+  adminLabel?: string;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+}
+
+export interface AdminBalanceAdjustResponse {
+  ok: boolean;
+  userId: number;
+  amount: number;
+  balanceBefore: number;
+  balanceAfter: number;
+  comment: string;
+  reportSent?: boolean;
+  timestamp: number;
+}
+
+export type AdminBroadcastMode = "mass" | "segment" | "targeted";
+
+export interface AdminBroadcastFilters {
+  welcomeBonus?: "any" | "claimed" | "not_claimed";
+  balance?: "any" | "positive" | "zero";
+  activePrivileges?: "any" | "yes" | "no";
+  activityMode?: "any" | "active" | "inactive";
+  activityDays?: number;
+  purchasePrivilege?: string;
+  purchaseServer?: string;
+}
+
+export interface AdminBroadcastTarget {
+  userIds?: number[] | string;
+  usernames?: string[] | string;
+}
+
+export interface AdminBroadcastContent {
+  textRu?: string;
+  textUz?: string;
+  photoDataUrl?: string;
+  photoName?: string;
+  photoMimeType?: string;
+  buttonUrl?: string;
+  buttonTextRu?: string;
+  buttonTextUz?: string;
+}
+
+export interface AdminBroadcastPreviewPayload {
+  mode: AdminBroadcastMode;
+  filters?: AdminBroadcastFilters;
+  target?: AdminBroadcastTarget;
+  content: AdminBroadcastContent;
+  createdBy?: string;
+}
+
+export interface AdminBroadcastRecipientSample {
+  userId: number;
+  username: string;
+  displayName: string;
+  language: "ru" | "uz";
+}
+
+export interface AdminBroadcastPreviewResponse {
+  ok: boolean;
+  preview: {
+    previewToken: string;
+    fingerprint: string;
+    expiresAt: number;
+    audience: {
+      totalRecipients: number;
+      sampleRecipients: AdminBroadcastRecipientSample[];
+      languageStats: {
+        ru: number;
+        uz: number;
+      };
+      missingUserIds: number[];
+      missingUsernames: string[];
+      generatedAt: number;
+    };
+    campaign: {
+      mode: AdminBroadcastMode;
+      createdBy: string;
+      audienceLabel: string;
+      hasPhoto: boolean;
+      hasButton: boolean;
+    };
+  };
+  timestamp: number;
+}
+
+export interface AdminBroadcastCreatePayload {
+  previewToken: string;
+  confirmSend: boolean;
+  confirmPhrase: string;
+}
+
+export interface AdminBroadcastCampaignLog {
+  status: "created" | "sent" | "failed" | "skipped" | "info";
+  message: string;
+  error?: string;
+  timestamp: number;
+  userId?: number;
+  username?: string;
+}
+
+export interface AdminBroadcastCampaignItem {
+  id: string;
+  status: "queued" | "sending" | "completed" | "failed" | "canceled";
+  mode: AdminBroadcastMode;
+  createdBy: string;
+  createdAt: number;
+  startedAt: number;
+  finishedAt: number;
+  audienceLabel: string;
+  stats: {
+    created: number;
+    sent: number;
+    failed: number;
+    skipped: number;
+    processed: number;
+  };
+  contentMeta: {
+    hasPhoto: boolean;
+    hasButton: boolean;
+    hasRu: boolean;
+    hasUz: boolean;
+  };
+  logs?: AdminBroadcastCampaignLog[];
+  totalLogs?: number;
+}
+
+export interface AdminBroadcastCampaignsResponse {
+  ok: boolean;
+  items: AdminBroadcastCampaignItem[];
+  total: number;
+  timestamp: number;
+}
+
+export interface AdminBroadcastCampaignResponse {
+  ok: boolean;
+  campaign: AdminBroadcastCampaignItem;
+  timestamp: number;
+}
+
+export interface AdminBroadcastCreateResponse {
+  ok: boolean;
+  campaign: AdminBroadcastCampaignItem;
+  timestamp: number;
+}
+
+export interface ActivityPingResponse {
+  ok: boolean;
+  activity: {
+    lastActivityAt: number;
+    source: string;
+    language?: "ru" | "uz";
+  };
+  timestamp: number;
+}
+
+export interface LegacyPrivilegeImportPayload {
+  userId: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  serverId: string;
+  serverName?: string;
+  identifierType: "nickname" | "steam";
+  nickname?: string;
+  steamId?: string;
+  password?: string;
+  language: "ru" | "uz";
+}
+
+export interface LegacyPrivilegeImportResponse {
+  ok: boolean;
+  alreadyImported: boolean;
+  notificationSent: boolean;
+  reportSent: boolean;
+  imported: {
+    serverId: string;
+    serverName: string;
+    privilege: string;
+    identifierType: "nickname" | "steam";
+    nickname: string;
+    steamId: string;
+    remainingDays: number;
+    totalDays: number;
+    isPermanent?: boolean;
+  };
+  privilegeItem: UserPrivilegeItem | null;
+  timestamp: number;
+}
+
 interface ServersResponse {
   servers: LiveServer[];
   total: number;
@@ -237,7 +625,28 @@ interface FetchPrivilegeAccountParams {
   serverName?: string;
 }
 
-const DEFAULT_PRODUCTION_API_BASE_URL = "https://strikeuzbotapi.loca.lt";
+const DEFAULT_PRODUCTION_API_BASE_URL = "https://sequence-mitsubishi-trek-engaged.trycloudflare.com";
+const API_BASE_STORAGE_KEY = "strike_api_base_url_v1";
+
+function normalizeApiBaseUrl(rawValue: string): string {
+  const raw = String(rawValue || "").trim();
+  if (!raw) {
+    return "";
+  }
+
+  // Allow pasting full miniapp URL with "?api=https://...".
+  try {
+    const parsedUrl = new URL(raw);
+    const apiFromQuery = normalizeApiBaseUrl(parsedUrl.searchParams.get("api") ?? "");
+    if (apiFromQuery) {
+      return apiFromQuery;
+    }
+  } catch {
+    // Keep raw value fallback for plain API base values.
+  }
+
+  return raw.replace(/\/$/, "");
+}
 
 function readRuntimeApiBaseUrl(): string {
   if (typeof window === "undefined") {
@@ -245,94 +654,348 @@ function readRuntimeApiBaseUrl(): string {
   }
   try {
     const params = new URLSearchParams(window.location.search);
-    return (params.get("api") ?? "").trim();
+    return normalizeApiBaseUrl(params.get("api") ?? "");
   } catch {
     return "";
   }
 }
 
+function readSavedApiBaseUrl(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+  try {
+    return normalizeApiBaseUrl(window.localStorage.getItem(API_BASE_STORAGE_KEY) ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function saveApiBaseUrl(rawValue: string): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  const safe = normalizeApiBaseUrl(rawValue);
+  if (!safe) {
+    return;
+  }
+  try {
+    window.localStorage.setItem(API_BASE_STORAGE_KEY, safe);
+  } catch {
+    // ignore storage write errors
+  }
+}
+
+function clearSavedApiBaseUrl(): void {
+  if (typeof window === "undefined") {
+    return;
+  }
+  try {
+    window.localStorage.removeItem(API_BASE_STORAGE_KEY);
+  } catch {
+    // ignore storage write errors
+  }
+}
+
 const RUNTIME_API_BASE_URL = readRuntimeApiBaseUrl();
-const RAW_API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "").trim();
-const API_BASE_URL = (
-  RUNTIME_API_BASE_URL ||
-  RAW_API_BASE_URL ||
-  (import.meta.env.PROD ? DEFAULT_PRODUCTION_API_BASE_URL : "")
-).replace(/\/$/, "");
+if (RUNTIME_API_BASE_URL) {
+  // Persist runtime API from Telegram miniapp URL so /admin keeps using the same backend.
+  saveApiBaseUrl(RUNTIME_API_BASE_URL);
+}
+const RAW_API_BASE_URL = normalizeApiBaseUrl(import.meta.env.VITE_API_BASE_URL ?? "");
+const SAVED_API_BASE_URL = readSavedApiBaseUrl();
+const DEFAULT_API_BASE_URL = normalizeApiBaseUrl(
+  import.meta.env.PROD ? DEFAULT_PRODUCTION_API_BASE_URL : "",
+);
+const API_BASE_CANDIDATES = Array.from(
+  new Set(
+    [
+      RUNTIME_API_BASE_URL,
+      SAVED_API_BASE_URL,
+      RAW_API_BASE_URL,
+      DEFAULT_API_BASE_URL,
+      ...(import.meta.env.PROD ? [] : [""]),
+    ]
+      .map((item) => normalizeApiBaseUrl(item))
+      .filter((item, index, source) => {
+        if (import.meta.env.PROD && !item) {
+          return false;
+        }
+        return source.indexOf(item) === index;
+      }),
+  ),
+);
+let activeApiBaseIndex = 0;
+let activeApiBaseUrl = API_BASE_CANDIDATES[activeApiBaseIndex] ?? "";
 const SERVERS_CACHE_KEY = "strikeuz_live_servers_cache_v1";
 const SERVERS_FETCH_ATTEMPTS = 3;
 const PRIVILEGE_LOOKUP_FETCH_ATTEMPTS = 3;
 
-function buildApiUrl(path: string): string {
-  return API_BASE_URL ? `${API_BASE_URL}${path}` : path;
+export function getResolvedApiBaseUrl(): string {
+  return activeApiBaseUrl;
 }
 
-function buildApiHeaders(): Record<string, string> {
+export function setPreferredApiBaseUrl(rawValue: string): string {
+  const safe = normalizeApiBaseUrl(rawValue);
+  if (safe) {
+    activeApiBaseUrl = safe;
+    activeApiBaseIndex = 0;
+    saveApiBaseUrl(safe);
+    return safe;
+  }
+
+  const emptyIndex = API_BASE_CANDIDATES.findIndex((item) => !item);
+  activeApiBaseIndex = emptyIndex >= 0 ? emptyIndex : 0;
+  activeApiBaseUrl = API_BASE_CANDIDATES[activeApiBaseIndex] ?? "";
+  clearSavedApiBaseUrl();
+  return activeApiBaseUrl;
+}
+
+function buildApiUrl(path: string, apiBaseUrl = activeApiBaseUrl): string {
+  return apiBaseUrl ? `${apiBaseUrl}${path}` : path;
+}
+
+function buildApiHeaders(
+  extraHeaders: Record<string, string> = {},
+  apiBaseUrl = activeApiBaseUrl,
+): Record<string, string> {
   const headers: Record<string, string> = {
     Accept: "application/json",
   };
 
   // localtunnel shows a browser warning page unless this header is present.
-  if (API_BASE_URL.includes(".loca.lt")) {
+  if (apiBaseUrl.includes(".loca.lt")) {
     headers["bypass-tunnel-reminder"] = "true";
   }
 
-  return headers;
+  return {
+    ...headers,
+    ...extraHeaders,
+  };
 }
 
 async function buildApiError(response: Response): Promise<Error> {
   let apiMessage = "";
   try {
-    const payload = (await response.json()) as { error?: unknown };
-    if (typeof payload?.error === "string") {
-      apiMessage = payload.error.trim();
+    const rawText = await response.text();
+    if (rawText.trim()) {
+      try {
+        const payload = JSON.parse(rawText) as { error?: unknown };
+        if (typeof payload?.error === "string") {
+          apiMessage = payload.error.trim();
+        }
+      } catch {
+        const compact = rawText.replace(/\s+/g, " ").trim().slice(0, 120);
+        if (compact) {
+          apiMessage = compact;
+        }
+      }
     }
   } catch {
     // ignore JSON parse errors
   }
 
+  class ApiHttpError extends Error {
+    status: number;
+
+    constructor(status: number, message: string) {
+      super(message);
+      this.name = "ApiHttpError";
+      this.status = Number(status || 0);
+    }
+  }
+
   if (apiMessage) {
-    return new Error(apiMessage);
+    return new ApiHttpError(response.status, apiMessage);
   }
-  return new Error(`API request failed: ${response.status}`);
+  return new ApiHttpError(response.status, `API request failed: ${response.status}`);
 }
 
-async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(buildApiUrl(path), {
-    headers: buildApiHeaders(),
-    cache: "no-store",
-  });
+class ApiParseError extends Error {
+  status: number;
 
-  if (!response.ok) {
-    throw await buildApiError(response);
+  constructor(message: string, status = 200) {
+    super(message);
+    this.name = "ApiParseError";
+    this.status = Number(status || 200);
   }
-
-  return (await response.json()) as T;
 }
 
-async function postJson<T>(path: string, payload: unknown): Promise<T> {
-  const response = await fetch(buildApiUrl(path), {
-    method: "POST",
-    headers: {
-      ...buildApiHeaders(),
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(payload),
-    cache: "no-store",
-  });
-
-  if (!response.ok) {
-    throw await buildApiError(response);
+async function parseApiJsonResponse<T>(
+  response: Response,
+  options: {
+    path: string;
+    apiBaseUrl: string;
+  },
+): Promise<T> {
+  const { path, apiBaseUrl } = options;
+  const rawText = await response.text();
+  const compact = rawText.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    throw new ApiParseError(`Пустой ответ API для ${path}. Проверьте URL API.`);
   }
 
-  return (await response.json()) as T;
+  try {
+    return JSON.parse(rawText) as T;
+  } catch {
+    const hintSource = apiBaseUrl || "relative (/api)";
+    throw new ApiParseError(
+      `API ${hintSource} вернул не JSON. Обновите страницу и повторите вход.`,
+      response.status || 200,
+    );
+  }
 }
 
-async function getJsonWithRetry<T>(path: string, attempts: number): Promise<T> {
+function isNetworkFetchError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const message = String(error.message || "").toLowerCase();
+  if (!message) {
+    return false;
+  }
+  return (
+    message.includes("failed to fetch") ||
+    message.includes("networkerror") ||
+    message.includes("load failed")
+  );
+}
+
+function isRecoverableApiStatusError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const safeStatus = Number(
+    (error as Error & { status?: unknown }).status,
+  );
+  if (!Number.isFinite(safeStatus)) {
+    return false;
+  }
+
+  const status = Math.trunc(safeStatus);
+  return status === 404 || status === 429 || status >= 500;
+}
+
+function isRecoverableApiParseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  return error.name === "ApiParseError";
+}
+
+function rotateApiBaseCandidate(): boolean {
+  const nextIndex = activeApiBaseIndex + 1;
+  if (nextIndex >= API_BASE_CANDIDATES.length) {
+    return false;
+  }
+  activeApiBaseIndex = nextIndex;
+  activeApiBaseUrl = API_BASE_CANDIDATES[activeApiBaseIndex] ?? "";
+  if (!activeApiBaseUrl) {
+    clearSavedApiBaseUrl();
+  }
+  return true;
+}
+
+async function getJson<T>(path: string, extraHeaders: Record<string, string> = {}): Promise<T> {
+  const attempts = Math.max(API_BASE_CANDIDATES.length, 1);
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const currentApiBaseUrl = activeApiBaseUrl;
+    try {
+      const response = await fetch(buildApiUrl(path, currentApiBaseUrl), {
+        headers: buildApiHeaders(extraHeaders, currentApiBaseUrl),
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        throw await buildApiError(response);
+      }
+      if (currentApiBaseUrl) {
+        saveApiBaseUrl(currentApiBaseUrl);
+      }
+      return await parseApiJsonResponse<T>(response, {
+        path,
+        apiBaseUrl: currentApiBaseUrl,
+      });
+    } catch (error) {
+      lastError = error;
+      const canRotate =
+        currentApiBaseUrl &&
+        (
+          isNetworkFetchError(error) ||
+          isRecoverableApiStatusError(error) ||
+          isRecoverableApiParseError(error)
+        );
+      if (!canRotate || !rotateApiBaseCandidate()) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Failed to fetch API");
+}
+
+async function postJson<T>(
+  path: string,
+  payload: unknown,
+  extraHeaders: Record<string, string> = {},
+): Promise<T> {
+  const attempts = Math.max(API_BASE_CANDIDATES.length, 1);
+  let lastError: unknown = null;
+
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const currentApiBaseUrl = activeApiBaseUrl;
+    try {
+      const response = await fetch(buildApiUrl(path, currentApiBaseUrl), {
+        method: "POST",
+        headers: {
+          ...buildApiHeaders(extraHeaders, currentApiBaseUrl),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        cache: "no-store",
+      });
+
+      if (!response.ok) {
+        throw await buildApiError(response);
+      }
+      if (currentApiBaseUrl) {
+        saveApiBaseUrl(currentApiBaseUrl);
+      }
+      return await parseApiJsonResponse<T>(response, {
+        path,
+        apiBaseUrl: currentApiBaseUrl,
+      });
+    } catch (error) {
+      lastError = error;
+      const canRotate =
+        currentApiBaseUrl &&
+        (
+          isNetworkFetchError(error) ||
+          isRecoverableApiStatusError(error) ||
+          isRecoverableApiParseError(error)
+        );
+      if (!canRotate || !rotateApiBaseCandidate()) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Failed to fetch API");
+}
+
+async function getJsonWithRetry<T>(
+  path: string,
+  attempts: number,
+  extraHeaders: Record<string, string> = {},
+): Promise<T> {
   let lastError: unknown = null;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await getJson<T>(path);
+      return await getJson<T>(path, extraHeaders);
     } catch (error) {
       lastError = error;
 
@@ -465,6 +1128,17 @@ export async function fetchUserBalance(userId: number): Promise<UserBalanceRespo
   return getJson<UserBalanceResponse>(`/api/balance?${params.toString()}`);
 }
 
+export async function fetchWelcomeBonusStatus(userId: number): Promise<WelcomeBonusStatusResponse> {
+  const params = new URLSearchParams({ userId: String(userId) });
+  return getJson<WelcomeBonusStatusResponse>(`/api/welcome-bonus-status?${params.toString()}`);
+}
+
+export async function claimWelcomeBonus(
+  payload: WelcomeBonusClaimPayload,
+): Promise<WelcomeBonusClaimResponse> {
+  return postJson<WelcomeBonusClaimResponse>("/api/welcome-bonus-claim", payload);
+}
+
 export async function fetchUserBalanceHistory(
   userId: number,
   limit = 120,
@@ -487,10 +1161,22 @@ export async function fetchUserPrivileges(
   return getJson<UserPrivilegesResponse>(`/api/user-privileges?${params.toString()}`);
 }
 
+export async function submitLegacyPrivilegeImport(
+  payload: LegacyPrivilegeImportPayload,
+): Promise<LegacyPrivilegeImportResponse> {
+  return postJson<LegacyPrivilegeImportResponse>("/api/legacy-privilege-import", payload);
+}
+
 export async function submitBalanceTopUp(
   payload: BalanceTopUpPayload,
 ): Promise<BalanceTopUpResponse> {
   return postJson<BalanceTopUpResponse>("/api/balance-topup", payload);
+}
+
+export async function startBalanceTopUpSession(
+  payload: BalanceTopUpSessionStartPayload,
+): Promise<BalanceTopUpSessionStartResponse> {
+  return postJson<BalanceTopUpSessionStartResponse>("/api/balance-topup-session-start", payload);
 }
 
 export async function fetchPaymentStatus(
@@ -503,4 +1189,137 @@ export async function fetchPaymentStatus(
     params.set("paymentSessionId", safeSessionId);
   }
   return getJson<PaymentStatusResponse>(`/api/payment-status?${params.toString()}`);
+}
+
+function buildAdminHeaders(adminKey: string): Record<string, string> {
+  const safeKey = adminKey.trim();
+  if (!safeKey) {
+    return {};
+  }
+  return {
+    "X-Admin-Key": safeKey,
+  };
+}
+
+export async function fetchAdminSummary(adminKey: string): Promise<AdminSummaryResponse> {
+  return getJson<AdminSummaryResponse>("/api/admin/summary", buildAdminHeaders(adminKey));
+}
+
+export async function fetchAdminUsers(
+  adminKey: string,
+  params: {
+    page: number;
+    pageSize?: number;
+    search?: string;
+  },
+): Promise<AdminUsersResponse> {
+  const query = new URLSearchParams({
+    page: String(Math.max(1, Math.floor(params.page || 1))),
+  });
+  if (typeof params.pageSize === "number" && Number.isFinite(params.pageSize)) {
+    query.set("pageSize", String(Math.max(1, Math.floor(params.pageSize))));
+  }
+  const safeSearch = String(params.search ?? "").trim();
+  if (safeSearch) {
+    query.set("search", safeSearch);
+  }
+  return getJson<AdminUsersResponse>(
+    `/api/admin/users?${query.toString()}`,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function submitAdminBalanceAdjust(
+  adminKey: string,
+  payload: AdminBalanceAdjustPayload,
+): Promise<AdminBalanceAdjustResponse> {
+  return postJson<AdminBalanceAdjustResponse>(
+    "/api/admin/balance-adjust",
+    payload,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function previewAdminBroadcast(
+  adminKey: string,
+  payload: AdminBroadcastPreviewPayload,
+): Promise<AdminBroadcastPreviewResponse> {
+  return postJson<AdminBroadcastPreviewResponse>(
+    "/api/admin/broadcasts/preview",
+    payload,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function createAdminBroadcastCampaign(
+  adminKey: string,
+  payload: AdminBroadcastCreatePayload,
+): Promise<AdminBroadcastCreateResponse> {
+  return postJson<AdminBroadcastCreateResponse>(
+    "/api/admin/broadcasts/create",
+    payload,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function fetchAdminBroadcastCampaigns(
+  adminKey: string,
+  limit = 30,
+): Promise<AdminBroadcastCampaignsResponse> {
+  const params = new URLSearchParams({
+    limit: String(Math.max(1, Math.floor(limit || 30))),
+  });
+  return getJson<AdminBroadcastCampaignsResponse>(
+    `/api/admin/broadcasts/campaigns?${params.toString()}`,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function fetchAdminBroadcastCampaign(
+  adminKey: string,
+  campaignId: string,
+  logsLimit = 300,
+): Promise<AdminBroadcastCampaignResponse> {
+  const params = new URLSearchParams({
+    campaignId: String(campaignId || "").trim(),
+    logsLimit: String(Math.max(1, Math.floor(logsLimit || 300))),
+  });
+  return getJson<AdminBroadcastCampaignResponse>(
+    `/api/admin/broadcasts/campaign?${params.toString()}`,
+    buildAdminHeaders(adminKey),
+  );
+}
+
+export async function sendActivityPing(payload: {
+  userId: number;
+  username?: string;
+  firstName?: string;
+  lastName?: string;
+  source?: string;
+  language?: "ru" | "uz";
+}): Promise<ActivityPingResponse> {
+  const params = new URLSearchParams({
+    userId: String(payload.userId),
+  });
+  const safeUsername = String(payload.username ?? "").trim();
+  if (safeUsername) {
+    params.set("username", safeUsername);
+  }
+  const safeFirstName = String(payload.firstName ?? "").trim();
+  if (safeFirstName) {
+    params.set("firstName", safeFirstName);
+  }
+  const safeLastName = String(payload.lastName ?? "").trim();
+  if (safeLastName) {
+    params.set("lastName", safeLastName);
+  }
+  const safeSource = String(payload.source ?? "").trim();
+  if (safeSource) {
+    params.set("source", safeSource);
+  }
+  const safeLanguage = String(payload.language ?? "").trim().toLowerCase();
+  if (safeLanguage === "ru" || safeLanguage === "uz") {
+    params.set("language", safeLanguage);
+  }
+  return getJson<ActivityPingResponse>(`/api/activity-ping?${params.toString()}`);
 }

@@ -28,8 +28,11 @@ def main():
 
     api_id_raw = os.getenv("TELEGRAM_APP_API_ID", "").strip()
     api_hash = os.getenv("TELEGRAM_APP_API_HASH", "").strip()
-    session_file = os.getenv("TELEGRAM_SESSION_FILE", "data/humo_telegram.session").strip()
-    humo_username = os.getenv("HUMO_BOT_USERNAME", "@HUMOcardbot").strip() or "@HUMOcardbot"
+    session_file = os.getenv("TELEGRAM_SESSION_FILE", "data/cardxabar_telegram.session").strip()
+    card_bot_username = (
+        os.getenv("CARD_BOT_USERNAME", os.getenv("HUMO_BOT_USERNAME", "@CardXabarBot")).strip()
+        or "@CardXabarBot"
+    )
 
     if not api_id_raw or not api_hash:
         raise RuntimeError("Set TELEGRAM_APP_API_ID and TELEGRAM_APP_API_HASH in .env first")
@@ -46,10 +49,10 @@ def main():
     with TelegramClient(str(session_path), api_id, api_hash) as client:
         client.start()
         me = client.get_me()
-        entity = client.get_entity(humo_username)
+        entity = client.get_entity(card_bot_username)
         username = str(getattr(entity, "username", "") or "").strip()
         print(f"Authorized as: id={getattr(me, 'id', 0)} username=@{getattr(me, 'username', '')}")
-        print(f"HUMO entity resolved as: @{username}")
+        print(f"Card bot entity resolved as: @{username}")
         print("")
         session_string = StringSession.save(client.session)
         print("Save this into .env for server mode:")
