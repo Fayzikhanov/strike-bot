@@ -984,27 +984,29 @@ class PaymentVerificationService:
                             post_balance_captured_at=int(time.time()),
                         )
 
-                confidence = 0.85 + (0.08 * ocr_confidence)
+                # A matched CardXabar transfer already passed hard checks:
+                # card last4, amount, message recency and payment session window.
+                # Do not downgrade to manual review only because OCR confidence/datetime is weak.
+                confidence = 0.93 + (0.04 * ocr_confidence)
                 if ocr_datetime is not None:
                     delta_seconds = transfer_match.get("ocr_delta_seconds")
                     if delta_seconds is not None:
                         if delta_seconds <= (self.config.ocr_transfer_time_tolerance_minutes * 60):
-                            confidence += 0.06
+                            confidence += 0.02
                         else:
-                            confidence -= 0.10
+                            confidence -= 0.01
                 if bool(ocr.get("recipient_matched")):
-                    confidence += 0.02
+                    confidence += 0.01
                 confidence = max(min(confidence, 0.99), 0.0)
 
-                decision = self._classify_decision(confidence, prefer_manual=True)
-                if decision == "ACCEPT":
-                    self._consume_transfer_message(
-                        consumed_state=consumed_state,
-                        transfer_match=transfer_match,
-                    )
-                    self._write_consumed_state(consumed_state)
+                decision = "ACCEPT"
+                self._consume_transfer_message(
+                    consumed_state=consumed_state,
+                    transfer_match=transfer_match,
+                )
+                self._write_consumed_state(consumed_state)
                 result = {
-                    "ok": decision == "ACCEPT",
+                    "ok": True,
                     "mode": "transfer_message",
                     "decision": decision,
                     "confidence": confidence,
@@ -1019,10 +1021,6 @@ class PaymentVerificationService:
                         "balance_fallback_used": False,
                     },
                 }
-                if decision != "ACCEPT":
-                    result["reason"] = (
-                        "Пополнение требует ручной проверки: недостаточная уверенность автоматической сверки."
-                    )
                 return result
 
             pre_balance = None
@@ -1107,29 +1105,30 @@ class PaymentVerificationService:
                         "source_bot": self.config.card_bot_username,
                     }
 
-                confidence = 0.80 + (0.06 * ocr_confidence)
+                # If OCR passed validation and balance delta exactly equals expected amount,
+                # this is a strong confirmation path for delayed/missing CardXabar reports.
+                confidence = 0.90 + (0.04 * ocr_confidence)
                 if ocr_datetime is not None:
-                    confidence += 0.04
-                else:
                     confidence += 0.02
+                else:
+                    confidence += 0.01
                 if bool(ocr.get("recipient_matched")):
-                    confidence += 0.03
+                    confidence += 0.01
                 if bool(ocr.get("is_payment_proof")):
-                    confidence += 0.03
-                confidence = max(min(confidence, 0.97), 0.0)
-                decision = self._classify_decision(confidence, prefer_manual=True)
-                if decision == "ACCEPT":
-                    self._consume_balance_diff(
-                        consumed_state=consumed_state,
-                        previous_balance=int(pre_balance),
-                        current_balance=int(post_balance),
-                        expected_amount=int(expected_amount),
-                        difference=int(difference),
-                        key_context=key_context,
-                    )
-                    self._write_consumed_state(consumed_state)
+                    confidence += 0.01
+                confidence = max(min(confidence, 0.98), 0.0)
+                decision = "ACCEPT"
+                self._consume_balance_diff(
+                    consumed_state=consumed_state,
+                    previous_balance=int(pre_balance),
+                    current_balance=int(post_balance),
+                    expected_amount=int(expected_amount),
+                    difference=int(difference),
+                    key_context=key_context,
+                )
+                self._write_consumed_state(consumed_state)
                 result = {
-                    "ok": decision == "ACCEPT",
+                    "ok": True,
                     "mode": "balance_diff",
                     "decision": decision,
                     "confidence": confidence,
@@ -1145,11 +1144,6 @@ class PaymentVerificationService:
                 }
                 if isinstance(capture_meta, dict):
                     result["capture"] = capture_meta
-                if decision != "ACCEPT":
-                    result["reason"] = (
-                        "Пополнение обнаружено по изменению баланса, но уверенность ниже порога. "
-                        "Требуется ручная проверка."
-                    )
                 return result
 
             if difference == 0:

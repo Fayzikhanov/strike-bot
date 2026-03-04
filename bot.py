@@ -7903,10 +7903,17 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 session_started_at=topup_session_started_at,
                 session_expires_at=topup_session_expires_at,
             )
+            verification_mode = str(payment_verification.get("mode", "")).strip()
+            verification_decision = str(payment_verification.get("decision", "")).strip().upper()
+            verification_confidence = float(payment_verification.get("confidence", 0) or 0)
+            verification_signals = {}
+            if isinstance(payment_verification.get("card_bot"), dict):
+                verification_signals = payment_verification.get("card_bot", {}).get("signals") or {}
+            elif isinstance(payment_verification.get("signals"), dict):
+                verification_signals = payment_verification.get("signals") or {}
 
             if not bool(payment_verification.get("ok")):
                 raw_reason = str(payment_verification.get("reason", "")).strip() or "Пополнение не подтверждено"
-                verification_decision = str(payment_verification.get("decision", "")).strip().upper()
                 manual_review = verification_decision == "MANUAL_REVIEW"
                 technical_error = is_technical_payment_verification_error(raw_reason)
                 friendly_reason = user_friendly_payment_reason(raw_reason, language)
@@ -7966,6 +7973,16 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                         )
 
                 notify_reason = localized_reason if technical_error else friendly_reason
+                print(
+                    (
+                        "[PAYMENT VERIFY] Rejected topup "
+                        f"user_id={user_id} mode={verification_mode or '-'} "
+                        f"decision={verification_decision or '-'} confidence={verification_confidence:.3f} "
+                        f"signals={json.dumps(verification_signals, ensure_ascii=False)} "
+                        f"reason={_redact_sensitive_text(raw_reason)}"
+                    ),
+                    file=sys.stderr,
+                )
                 send_payment_verification_failed_message(
                     user_id=user_id,
                     reason=notify_reason,
@@ -7996,6 +8013,15 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 return
 
             credited_amount = int(payment_verification.get("credited_amount", 0) or 0)
+            print(
+                (
+                    "[PAYMENT VERIFY] Approved topup "
+                    f"user_id={user_id} amount={credited_amount} mode={verification_mode or '-'} "
+                    f"decision={verification_decision or '-'} confidence={verification_confidence:.3f} "
+                    f"signals={json.dumps(verification_signals, ensure_ascii=False)}"
+                ),
+                file=sys.stderr,
+            )
             if credited_amount <= 0:
                 self._send_json(
                     400,
@@ -8332,6 +8358,13 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
             if not bool(payment_verification.get("ok")):
                 raw_reason = str(payment_verification.get("reason", "")).strip() or "Payment verification failed"
                 verification_decision = str(payment_verification.get("decision", "")).strip().upper()
+                verification_mode = str(payment_verification.get("mode", "")).strip()
+                verification_confidence = float(payment_verification.get("confidence", 0) or 0)
+                verification_signals = {}
+                if isinstance(payment_verification.get("card_bot"), dict):
+                    verification_signals = payment_verification.get("card_bot", {}).get("signals") or {}
+                elif isinstance(payment_verification.get("signals"), dict):
+                    verification_signals = payment_verification.get("signals") or {}
                 manual_review = verification_decision == "MANUAL_REVIEW"
                 technical_error = is_technical_payment_verification_error(raw_reason)
                 friendly_reason = user_friendly_payment_reason(raw_reason, language)
@@ -8392,7 +8425,10 @@ class MiniAppAPIHandler(BaseHTTPRequestHandler):
                 print(
                     (
                         "[PAYMENT VERIFY] Rejected purchase "
-                        f"user_id={user_id} amount={amount} reason={_redact_sensitive_text(raw_reason)} "
+                        f"user_id={user_id} amount={amount} mode={verification_mode or '-'} "
+                        f"decision={verification_decision or '-'} confidence={verification_confidence:.3f} "
+                        f"signals={json.dumps(verification_signals, ensure_ascii=False)} "
+                        f"reason={_redact_sensitive_text(raw_reason)} "
                         f"remaining_attempts={remaining_attempts}"
                     ),
                     file=sys.stderr,
