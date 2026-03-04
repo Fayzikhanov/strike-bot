@@ -80,6 +80,7 @@ def _env_int(name, default_value):
 
 TOKEN = os.getenv("BOT_TOKEN", "").strip()
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip()
+BOT_USERNAME = os.getenv("BOT_USERNAME", "strikeuzbot").strip().lstrip("@")
 
 _TUNNEL_URL_FILE = os.path.join(os.path.dirname(__file__), "data", "web_app_url.txt")
 
@@ -5997,13 +5998,22 @@ def get_server_info(port):
         "max": 0,
     }
 
+def _build_group_miniapp_deeplink() -> str:
+    safe_username = str(BOT_USERNAME or "").strip().lstrip("@")
+    if not safe_username:
+        return ""
+    return f"https://t.me/{safe_username}?startapp=main"
+
+
 def main_inline_keyboard(chat_type="private"):
     _url = get_web_app_url()
     safe_chat_type = str(chat_type or "").strip().lower()
     is_group_chat = safe_chat_type in {"group", "supergroup"}
+    group_miniapp_url = _build_group_miniapp_deeplink() if is_group_chat else ""
+    target_url = group_miniapp_url or _url
     app_button = (
-        InlineKeyboardButton("📱 App", url=_url)
-        if (_url and is_group_chat)
+        InlineKeyboardButton("📱 App", url=target_url)
+        if (target_url and is_group_chat)
         else InlineKeyboardButton("📱 App", web_app=WebAppInfo(url=_url))
         if _url
         else InlineKeyboardButton("📱 App", callback_data="menu_app_unavailable")
