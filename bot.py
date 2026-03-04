@@ -5739,6 +5739,16 @@ def build_main_keyboard():
     )
 
 
+def build_group_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton("👥 Players"), KeyboardButton("🌐 Servers")],
+            [KeyboardButton("📱 App")],
+        ],
+        resize_keyboard=True,
+    )
+
+
 async def configure_chat_menu_button(application):
     _url = get_web_app_url()
     if not _url:
@@ -6031,20 +6041,39 @@ def main_inline_keyboard(chat_type="private"):
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="menu_command")
     chat_type = update.effective_chat.type if update.effective_chat else ""
-    await update.message.reply_text(
-        "🎮 <b>Strike.Uz меню</b>",
-        reply_markup=main_inline_keyboard(chat_type),
-        parse_mode="HTML"
-    )
+    if chat_type in {"group", "supergroup"}:
+        await update.message.reply_text(
+            "🎮 <b>Strike.Uz меню</b>",
+            reply_markup=build_group_keyboard(),
+            parse_mode="HTML",
+        )
+    else:
+        await update.message.reply_text(
+            "🎮 <b>Strike.Uz меню</b>",
+            reply_markup=main_inline_keyboard(chat_type),
+            parse_mode="HTML",
+        )
 
 
 async def miniapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="miniapp_command")
     _url = get_web_app_url()
+    chat_type = update.effective_chat.type if update.effective_chat else ""
     if not _url:
         await update.message.reply_text(
             "❌ Mini App hali sozlanmagan. WEB_APP_URL o'zgaruvchisini kiriting.\n❌ Mini App пока не настроен. Укажите WEB_APP_URL.",
             parse_mode="HTML",
+        )
+        return
+
+    if chat_type in {"group", "supergroup"}:
+        group_url = _build_group_miniapp_deeplink() or _url
+        await update.message.reply_text(
+            "🌐 <b>Strike.Uz Mini App</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open Mini App", url=group_url)]]
+            ),
         )
         return
 
@@ -6158,7 +6187,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/info — Информация\n"
             "/vip — VIP",
             parse_mode="HTML",
-            reply_markup=main_inline_keyboard(chat_type)
+            reply_markup=build_group_keyboard()
         )
 
 
@@ -10175,11 +10204,17 @@ async def buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     touch_user_activity_from_update(update, source="buttons_handler")
     text = message.text
 
-    if text == "🌐 Servers":
+    if text in {"🌐 Servers", "🌍 Servers"}:
         await server(update, context)
 
     elif text == "📱 App":
         await miniapp(update, context)
+
+    elif text in {"ℹ️ Info", "ℹ Info"}:
+        await info(update, context)
+
+    elif text in {"⭐ VIP", "🌟 VIP"}:
+        await vip(update, context)
 
     elif text == "🎮 Start CS":
         await message.reply_text(
