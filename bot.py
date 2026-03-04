@@ -184,6 +184,31 @@ SERVERS = {
 }
 KNOWN_PORTS = {port for category in SERVERS.values() for port in category["servers"]}
 
+
+def _build_default_server_name_by_port():
+    mapping = {
+        27015: "Strike.Uz | Public Style #1",
+        27016: "Strike.Uz | Only Dust",
+        27017: "Strike.Uz | CSDM [FFA]",
+        27018: "Strike.Uz | HidenSeek",
+    }
+
+    clanwar_ports = []
+    for bucket in ("cw1", "cw2"):
+        category = SERVERS.get(bucket, {})
+        clanwar_ports.extend(category.get("servers", []))
+
+    for index, port in enumerate(clanwar_ports, start=1):
+        mapping.setdefault(port, f"Strike.Uz | ClanWar #{index}")
+
+    for port in KNOWN_PORTS:
+        mapping.setdefault(port, f"Strike.Uz | Server {port}")
+
+    return mapping
+
+
+DEFAULT_SERVER_NAME_BY_PORT = _build_default_server_name_by_port()
+
 DATA_URL_PATTERN = re.compile(r"^data:(?P<mime>[\w.+-]+/[\w.+-]+);base64,(?P<data>[A-Za-z0-9+/=\s]+)$")
 FILENAME_SAFE_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 STEAM_ID_PATTERN = re.compile(r"^STEAM_[01]:[01]:\d{5,15}$", re.IGNORECASE)
@@ -202,6 +227,10 @@ PRIVILEGE_IDENTIFIER_STEAM = "steam"
 MONITORING_URL = os.getenv("MONITORING_URL", "https://strike.uz/").strip() or "https://strike.uz/"
 MONITORING_TIMEOUT_SECONDS = float(os.getenv("MONITORING_TIMEOUT_SECONDS", "8").strip() or "8")
 MONITORING_CACHE_TTL_SECONDS = int(os.getenv("MONITORING_CACHE_TTL_SECONDS", "20").strip() or "20")
+SERVER_INFO_CACHE_TTL_SECONDS = max(
+    _env_int("SERVER_INFO_CACHE_TTL_SECONDS", 1800),
+    60,
+)
 
 PHPMYADMIN_BASE_URL = os.getenv("PHPMYADMIN_BASE_URL", "").strip().rstrip("/")
 PHPMYADMIN_LOGIN = os.getenv("PHPMYADMIN_LOGIN", "").strip()
@@ -447,7 +476,9 @@ MONITORING_CACHE = {
 MONITORING_LAST_ERROR_LOG_TS = 0.0
 MONITORING_ERROR_LOG_COOLDOWN_SECONDS = 30.0
 A2S_STATE_LOCK = threading.Lock()
-A2S_DISABLED_UNTIL = 0.0
+A2S_DISABLED_UNTIL_BY_PORT = {}
+SERVER_INFO_CACHE_LOCK = threading.Lock()
+SERVER_INFO_CACHE = {}
 FTP_PATH_CACHE_LOCK = threading.Lock()
 PAYMENT_VERIFIER = PaymentVerificationService()
 BROADCAST_RUNTIME_LOCK = threading.Lock()
@@ -6395,66 +6426,147 @@ if not hasattr(a2s, "info") or not hasattr(a2s, "players"):
     raise RuntimeError("Invalid a2s package installed. Install `python-a2s`.")
 
 
-def _a2s_is_temporarily_disabled():
+def _a2s_is_temporarily_disabled(port):
     if A2S_COOLDOWN_SECONDS <= 0:
         return False
+
+    safe_port = int(port)
+    now = time.time()
     with A2S_STATE_LOCK:
-        return time.time() < A2S_DISABLED_UNTIL
+        disabled_until = float(A2S_DISABLED_UNTIL_BY_PORT.get(safe_port, 0.0) or 0.0)
+        if now >= disabled_until:
+            A2S_DISABLED_UNTIL_BY_PORT.pop(safe_port, None)
+            return False
+        return True
 
 
-def _mark_a2s_failure():
+def _mark_a2s_failure(port):
     if A2S_COOLDOWN_SECONDS <= 0:
         return True
 
+    safe_port = int(port)
+    now = time.time()
     with A2S_STATE_LOCK:
-        global A2S_DISABLED_UNTIL
-        now = time.time()
-        was_disabled = now < A2S_DISABLED_UNTIL
-        A2S_DISABLED_UNTIL = max(A2S_DISABLED_UNTIL, now + A2S_COOLDOWN_SECONDS)
+        disabled_until = float(A2S_DISABLED_UNTIL_BY_PORT.get(safe_port, 0.0) or 0.0)
+        was_disabled = now < disabled_until
+        A2S_DISABLED_UNTIL_BY_PORT[safe_port] = max(disabled_until, now + A2S_COOLDOWN_SECONDS)
         return not was_disabled
 
 
-def _mark_a2s_success():
+def _mark_a2s_success(port):
+    safe_port = int(port)
     with A2S_STATE_LOCK:
-        global A2S_DISABLED_UNTIL
-        A2S_DISABLED_UNTIL = 0.0
+        A2S_DISABLED_UNTIL_BY_PORT.pop(safe_port, None)
+
+
+def _remember_server_info_snapshot(port, info):
+    safe_port = int(port)
+    safe_info = dict(info or {})
+
+    name = str(safe_info.get("name", "")).strip()
+    map_name = str(safe_info.get("map", "")).strip()
+    try:
+        players = max(int(safe_info.get("players", 0) or 0), 0)
+    except (TypeError, ValueError):
+        players = 0
+    try:
+        max_players = max(int(safe_info.get("max", 0) or 0), 0)
+    except (TypeError, ValueError):
+        max_players = 0
+
+    # Skip caching pure placeholders from hard fallback.
+    if (
+        name.lower().startswith("server ")
+        and map_name.lower() in {"", "unknown"}
+        and players <= 0
+        and max_players <= 0
+    ):
+        return
+
+    with SERVER_INFO_CACHE_LOCK:
+        SERVER_INFO_CACHE[safe_port] = {
+            "timestamp": time.time(),
+            "info": {
+                "name": name or DEFAULT_SERVER_NAME_BY_PORT.get(safe_port, f"Server {safe_port}"),
+                "map": map_name or "unknown",
+                "players": players,
+                "max": max_players,
+            },
+        }
+
+
+def _get_cached_server_info(port):
+    safe_port = int(port)
+    now = time.time()
+    with SERVER_INFO_CACHE_LOCK:
+        cached = SERVER_INFO_CACHE.get(safe_port)
+        if not cached:
+            return None
+
+        cached_at = float(cached.get("timestamp", 0.0) or 0.0)
+        if SERVER_INFO_CACHE_TTL_SECONDS > 0 and (now - cached_at) > SERVER_INFO_CACHE_TTL_SECONDS:
+            SERVER_INFO_CACHE.pop(safe_port, None)
+            return None
+
+        info = cached.get("info", {})
+        if not isinstance(info, dict):
+            return None
+        return {
+            "name": str(info.get("name", "")).strip() or DEFAULT_SERVER_NAME_BY_PORT.get(safe_port, f"Server {safe_port}"),
+            "map": str(info.get("map", "")).strip() or "unknown",
+            "players": max(int(info.get("players", 0) or 0), 0),
+            "max": max(int(info.get("max", 0) or 0), 0),
+        }
+
+
+def _build_default_server_info(port):
+    safe_port = int(port)
+    return {
+        "name": DEFAULT_SERVER_NAME_BY_PORT.get(safe_port, f"Server {safe_port}"),
+        "map": "unknown",
+        "players": 0,
+        "max": 0,
+    }
 
 
 def get_server_info(port):
-    if not _a2s_is_temporarily_disabled():
-        try:
-            info = a2s.info((BASE_IP, port), timeout=A2S_TIMEOUT)
-            _mark_a2s_success()
+    safe_port = int(port)
 
-            return {
+    if not _a2s_is_temporarily_disabled(safe_port):
+        try:
+            info = a2s.info((BASE_IP, safe_port), timeout=A2S_TIMEOUT)
+            payload = {
                 "name": info.server_name,
                 "map": info.map_name,
                 "players": info.player_count,
                 "max": info.max_players,
             }
+            _mark_a2s_success(safe_port)
+            _remember_server_info_snapshot(safe_port, payload)
+            return payload
 
         except Exception as error:
-            should_log = _mark_a2s_failure()
+            should_log = _mark_a2s_failure(safe_port)
             if should_log:
                 print(
                     (
-                        f"[INFO ERROR] {BASE_IP}:{port} -> {error}; "
+                        f"[INFO ERROR] {BASE_IP}:{safe_port} -> {error}; "
                         f"using monitoring fallback for {int(A2S_COOLDOWN_SECONDS)}s"
                     ),
                     file=sys.stderr,
                 )
 
     snapshot = _get_monitoring_servers_snapshot()
-    fallback = snapshot.get(port)
+    fallback = snapshot.get(safe_port)
     if fallback:
+        _remember_server_info_snapshot(safe_port, fallback)
         return fallback
 
-    return {
-        "name": f"Server {port}",
-        "map": "unknown",
-        "players": 0,
-        "max": 0,
-    }
+    cached = _get_cached_server_info(safe_port)
+    if cached:
+        return cached
+
+    return _build_default_server_info(safe_port)
 
 def _build_group_miniapp_deeplink() -> str:
     safe_username = str(BOT_USERNAME or "").strip().lstrip("@")

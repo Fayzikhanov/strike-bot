@@ -1074,6 +1074,27 @@ function writeCachedServers(servers: LiveServer[]): void {
   }
 }
 
+function isServerPlaceholder(server: LiveServer): boolean {
+  const normalizedName = String(server.name || "").trim().toLowerCase();
+  const normalizedMap = String(server.map || "").trim().toLowerCase();
+  const players = Number(server.players || 0);
+  const maxPlayers = Number(server.max || server.maxPlayers || 0);
+
+  return (
+    (normalizedName.startsWith("server ") || !normalizedName) &&
+    (!normalizedMap || normalizedMap === "unknown") &&
+    players <= 0 &&
+    maxPlayers <= 0
+  );
+}
+
+function isDegradedServersSnapshot(servers: LiveServer[]): boolean {
+  if (servers.length === 0) {
+    return true;
+  }
+  return servers.every(isServerPlaceholder);
+}
+
 // Important: Servers/players in miniapp must come only from live Strike.Uz API (a2s).
 export async function fetchServers(): Promise<LiveServer[]> {
   try {
@@ -1081,8 +1102,20 @@ export async function fetchServers(): Promise<LiveServer[]> {
       "/api/servers",
       SERVERS_FETCH_ATTEMPTS,
     );
-    writeCachedServers(payload.servers);
-    return payload.servers;
+    const liveServers = Array.isArray(payload.servers) ? payload.servers : [];
+    const cachedServers = readCachedServers();
+    const degradedSnapshot = isDegradedServersSnapshot(liveServers);
+
+    if (!degradedSnapshot) {
+      writeCachedServers(liveServers);
+      return liveServers;
+    }
+
+    if (cachedServers.length > 0) {
+      return cachedServers;
+    }
+
+    return liveServers;
   } catch (error) {
     const cachedServers = readCachedServers();
     if (cachedServers.length > 0) {
