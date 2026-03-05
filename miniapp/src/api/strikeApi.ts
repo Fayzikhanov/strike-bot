@@ -663,6 +663,16 @@ const DEFAULT_PRODUCTION_API_BASE_URLS = [
   "https://sequence-mitsubishi-trek-engaged.trycloudflare.com",
 ] as const;
 const API_BASE_STORAGE_KEY = "strike_api_base_url_v1";
+const APP_BASE_PATH = String(import.meta.env.VITE_APP_BASE_PATH ?? "").trim();
+
+function normalizePathPrefix(rawValue: string): string {
+  const raw = String(rawValue || "").trim();
+  if (!raw || raw === "/") {
+    return "";
+  }
+  const withLeading = raw.startsWith("/") ? raw : `/${raw}`;
+  return withLeading.replace(/\/+$/, "");
+}
 
 function normalizeApiBaseUrl(rawValue: string): string {
   const raw = String(rawValue || "").trim();
@@ -691,6 +701,34 @@ function readRuntimeApiBaseUrl(): string {
   try {
     const params = new URLSearchParams(window.location.search);
     return normalizeApiBaseUrl(params.get("api") ?? "");
+  } catch {
+    return "";
+  }
+}
+
+function readPathScopedApiBaseUrl(): string {
+  if (typeof window === "undefined") {
+    return "";
+  }
+
+  try {
+    const appPrefixFromEnv = normalizePathPrefix(APP_BASE_PATH);
+    const pathName = String(window.location.pathname || "").trim();
+    const appPrefix =
+      appPrefixFromEnv ||
+      (pathName === "/strike" || pathName.startsWith("/strike/") ? "/strike" : "");
+
+    if (!appPrefix) {
+      return "";
+    }
+
+    const origin = String(window.location.origin || "").trim().replace(/\/$/, "");
+    if (!origin) {
+      return "";
+    }
+
+    // Build API base as "<origin>/<app-prefix>" so requests to "/api/..." become "/<app-prefix>/api/...".
+    return normalizeApiBaseUrl(`${origin}${appPrefix}`);
   } catch {
     return "";
   }
@@ -734,6 +772,7 @@ function clearSavedApiBaseUrl(): void {
 }
 
 const RUNTIME_API_BASE_URL = readRuntimeApiBaseUrl();
+const PATH_SCOPED_API_BASE_URL = readPathScopedApiBaseUrl();
 if (RUNTIME_API_BASE_URL) {
   // Persist runtime API from Telegram miniapp URL so /admin keeps using the same backend.
   saveApiBaseUrl(RUNTIME_API_BASE_URL);
@@ -748,6 +787,7 @@ const API_BASE_CANDIDATES = Array.from(
     [
       RUNTIME_API_BASE_URL,
       SAVED_API_BASE_URL,
+      PATH_SCOPED_API_BASE_URL,
       RAW_API_BASE_URL,
       ...DEFAULT_API_BASE_URLS,
       ...(import.meta.env.PROD ? [] : [""]),

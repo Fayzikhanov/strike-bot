@@ -10,33 +10,42 @@ import { AdminLogin } from "./pages/AdminLogin";
 import { AdminBroadcasts } from "./pages/AdminBroadcasts";
 import { AdminPanelShell } from "./components/admin/AdminPanelShell";
 
+const ROUTER_BASENAME = String(import.meta.env.BASE_URL || "/")
+  .replace(/\/+$/, "")
+  .trim();
+
 function AdminRootRedirect() {
   return <Navigate to="/admin/dashboard" replace />;
 }
 
-export const router = createBrowserRouter([
+export const router = createBrowserRouter(
+  [
+    {
+      path: "/admin/login",
+      Component: AdminLogin,
+    },
+    {
+      path: "/admin",
+      Component: AdminPanelShell,
+      children: [
+        { index: true, Component: AdminRootRedirect },
+        { path: "dashboard", Component: AdminDashboard },
+        { path: "broadcasts", Component: AdminBroadcasts },
+      ],
+    },
+    {
+      path: "/",
+      Component: Layout,
+      children: [
+        { index: true, Component: ServersList },
+        { path: "server/:id", Component: ServerDetail },
+        { path: "privileges", Component: Privileges },
+        { path: "purchase", Component: Purchase },
+        { path: "profile", Component: Profile },
+      ],
+    },
+  ],
   {
-    path: "/admin/login",
-    Component: AdminLogin,
+    basename: ROUTER_BASENAME || undefined,
   },
-  {
-    path: "/admin",
-    Component: AdminPanelShell,
-    children: [
-      { index: true, Component: AdminRootRedirect },
-      { path: "dashboard", Component: AdminDashboard },
-      { path: "broadcasts", Component: AdminBroadcasts },
-    ],
-  },
-  {
-    path: "/",
-    Component: Layout,
-    children: [
-      { index: true, Component: ServersList },
-      { path: "server/:id", Component: ServerDetail },
-      { path: "privileges", Component: Privileges },
-      { path: "purchase", Component: Purchase },
-      { path: "profile", Component: Profile },
-    ],
-  },
-]);
+);
