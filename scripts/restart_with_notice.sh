@@ -13,18 +13,36 @@ NOTICE_MINUTES="${NOTICE_MINUTES:-2}"
 NOTICE_REASON="${NOTICE_REASON:-Обновление / Yangilanish}"
 NOTICE_DELAY_SECONDS="${NOTICE_DELAY_SECONDS:-15}"
 
+read_env_value() {
+  local key="$1"
+  local file="$2"
+  awk -F= -v target_key="$key" '
+    $1 == target_key {
+      value = substr($0, index($0, "=") + 1)
+      gsub(/\r/, "", value)
+      print value
+      exit
+    }
+  ' "$file"
+}
+
+BOT_TOKEN_VALUE="${BOT_TOKEN:-}"
+WEB_APP_URL_VALUE="${WEB_APP_URL:-}"
+
 if [[ -f "${ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${ENV_FILE}"
-  set +a
+  if [[ -z "${BOT_TOKEN_VALUE}" ]]; then
+    BOT_TOKEN_VALUE="$(read_env_value "BOT_TOKEN" "${ENV_FILE}")"
+  fi
+  if [[ -z "${WEB_APP_URL_VALUE}" ]]; then
+    WEB_APP_URL_VALUE="$(read_env_value "WEB_APP_URL" "${ENV_FILE}")"
+  fi
 fi
 
 if [[ -x "${PYTHON_BIN}" && -f "${NOTICE_SCRIPT}" ]]; then
   "${PYTHON_BIN}" "${NOTICE_SCRIPT}" \
     --data-file "${REPO_DIR}/data/purchase_reports.json" \
-    --bot-token "${BOT_TOKEN:-}" \
-    --web-app-url "${WEB_APP_URL:-}" \
+    --bot-token "${BOT_TOKEN_VALUE}" \
+    --web-app-url "${WEB_APP_URL_VALUE}" \
     --minutes "${NOTICE_MINUTES}" \
     --reason "${NOTICE_REASON}" || true
 else
