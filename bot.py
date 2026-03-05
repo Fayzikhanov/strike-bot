@@ -99,7 +99,7 @@ def get_web_app_url() -> str:
 BASE_IP = "83.69.139.205"
 A2S_TIMEOUT = 3.0
 A2S_COOLDOWN_SECONDS = float(os.getenv("A2S_COOLDOWN_SECONDS", "60").strip() or "60")
-API_HOST = os.getenv("API_HOST", "0.0.0.0")
+API_HOST = os.getenv("API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("API_PORT", "8090"))
 ADMIN_DASHBOARD_KEY = os.getenv("ADMIN_DASHBOARD_KEY", "").strip()
 OWNER_BROADCAST_USER_ID = max(_env_int("OWNER_BROADCAST_USER_ID", 829988791), 0)
